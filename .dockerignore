@@ -1,0 +1,23 @@
+# Keep the build context small and clean (esp. for the root/server image with context ".").
+**/.venv
+**/venv
+**/node_modules
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/*.egg-info
+web/dist
+.vite
+data
+*.db
+*.db-wal
+*.db-shm
+.git
+.github
+.gitignore
+.gitattributes
+**/.runner-config.json
+.env
+NOTES.md
+*.md
+!runner/README.md

@@ -1,0 +1,64 @@
+<script setup>
+import { ref, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { api } from '../api'
+import { timeAgo } from '../util'
+
+const router = useRouter()
+const runners = ref([])
+const newToken = ref('')
+let timer = null
+
+async function load() { try { runners.value = await api.get('/runners') } catch (e) { /* transient */ } }
+async function mkToken() {
+  try { const r = await api.post('/enroll-tokens', { label: 'ui' }); newToken.value = r.token }
+  catch (e) { alert(e.message) }
+}
+function open(r) { router.push('/scanners/' + r.id) }
+function meterClass(v) { return v >= 85 ? 'hi' : (v >= 60 ? 'mid' : '') }
+onMounted(async () => { await load(); timer = setInterval(load, 3000) })
+onUnmounted(() => clearInterval(timer))
+</script>
+
+<template>
+  <div class="row" style="justify-content:space-between">
+    <h1>Scanners</h1>
+    <button class="primary" @click="mkToken">New enroll token</button>
+  </div>
+  <div v-if="newToken" class="card" style="margin:10px 0">
+    <b>Enroll token (shown once):</b> <code style="word-break:break-all">{{ newToken }}</code>
+    <div class="muted" style="font-size:12px">Paste this into a scanner's local UI (or set <code>ENROLL_TOKEN</code>) to connect it.</div>
+  </div>
+
+  <div class="card tablecard">
+  <table class="reflow rows">
+    <thead><tr><th></th><th>Scanner</th><th>IP</th><th>Status</th><th>Slots</th><th>CPU</th><th>Memory</th><th>Version</th><th>Last beat</th></tr></thead>
+    <tbody>
+      <tr v-for="r in runners" :key="r.id" @click="open(r)" style="cursor:pointer">
+        <td data-label=""><span class="dot" :class="r.status === 'disconnected' ? 'bad' : (r.status === 'busy' ? 'busy' : 'ok')"></span></td>
+        <td data-label="Scanner"><b>{{ r.name || ('runner #' + r.id) }}</b></td>
+        <td data-label="IP"><code>{{ r.ip || '—' }}</code></td>
+        <td data-label="Status">{{ r.status }}</td>
+        <td data-label="Slots">{{ r.busy_slots }}/{{ r.slots }}</td>
+        <td data-label="CPU">
+          <template v-if="r.metrics && r.metrics.cpu != null">
+            <div class="meter" style="min-width:70px"><div :class="meterClass(r.metrics.cpu)" :style="{ width: r.metrics.cpu + '%' }"></div></div>
+            <span class="muted" style="font-size:12px">{{ r.metrics.cpu }}%</span>
+          </template>
+          <span v-else class="muted">—</span>
+        </td>
+        <td data-label="Memory">
+          <template v-if="r.metrics && r.metrics.mem != null">
+            <div class="meter" style="min-width:70px"><div :class="meterClass(r.metrics.mem)" :style="{ width: r.metrics.mem + '%' }"></div></div>
+            <span class="muted" style="font-size:12px">{{ r.metrics.mem }}%</span>
+          </template>
+          <span v-else class="muted">—</span>
+        </td>
+        <td data-label="Version">v{{ r.version || '?' }}</td>
+        <td data-label="Last beat">{{ timeAgo(r.last_heartbeat) }}</td>
+      </tr>
+      <tr v-if="!runners.length"><td colspan="9" class="muted">No scanners connected. Start one and enroll it with a token.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</template>

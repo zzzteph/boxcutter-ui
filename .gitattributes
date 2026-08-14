@@ -1,0 +1,5 @@
+# Normalize line endings to LF; runners and images are Linux, and CRLF breaks Dockerfiles / shebangs.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

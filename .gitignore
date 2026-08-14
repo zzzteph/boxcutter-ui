@@ -1,0 +1,37 @@
+# env & secrets
+.env
+*.local
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# data / db
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# node / vite
+node_modules/
+web/dist/
+.vite/
+
+# runner local config
+runner/.runner-config.json
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# planning / AI-session docs — not part of the deployed product
+NOTES.md
+BUILD.md
+SPEC.md
+CLAUDE.md
