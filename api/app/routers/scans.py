@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, delete, func, or_
 from sqlmodel import Session, select
 
 from ..activity import log_activity
@@ -161,6 +161,22 @@ def update_scan(scan_id: int, body: ScanPatch, user: User = Depends(current_user
     session.commit()
     log_activity(session, "scan_updated", f"Scan '{scan.name}' inputs updated", scan_id=scan.id)
     return get_scan(scan_id, user, session)
+
+
+@router.delete("/{scan_id}")
+def delete_scan(scan_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    """Delete a scan and everything it owns. Set-based deletes (a scan can have 100k+ findings/jobs), children
+    first so no foreign keys dangle."""
+    scan = session.get(Scan, scan_id)
+    if not scan or not _perm(session, scan, user):
+        raise HTTPException(404, "not found")
+    name = scan.name
+    for model in (Finding, JobEvent, Job, Target, Activity):
+        session.execute(delete(model).where(model.scan_id == scan_id))
+    session.delete(scan)
+    session.commit()
+    log_activity(session, "scan_deleted", f"Scan '{name}' deleted")     # scan_id omitted — the row is gone
+    return {"ok": True}
 
 
 _SEV_RANK = ["Critical", "High", "Medium", "Low", "Info"]

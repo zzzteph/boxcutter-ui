@@ -34,7 +34,7 @@ export const api = {
   post: (p, b) => req('POST', p, b),
   patch: (p, b) => req('PATCH', p, b),
   del: (p) => req('DELETE', p),
-  login: (username, password) => req('POST', '/auth/login', { username, password }),
+  login: (username, password, code) => req('POST', '/auth/login', { username, password, code }),
   me: () => req('GET', '/auth/me'),
   changePassword: (current_password, new_password) =>
     req('POST', '/auth/change-password', { current_password, new_password }),

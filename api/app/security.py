@@ -1,9 +1,15 @@
-"""Password hashing, JWT for users, and token auth for runners."""
+"""Password hashing, JWT for users, TOTP 2FA, and token auth for runners."""
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
+import os
 import secrets
+import struct
+import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import jwt
 from fastapi import Depends, Header, HTTPException
@@ -25,6 +31,35 @@ def hash_password(p: str) -> str:
 
 def verify_password(p: str, h: str) -> bool:
     return _pwd.verify(p, h)
+
+
+# ---- TOTP 2FA (RFC 6238, SHA-1, 6 digits, 30s) — stdlib only, no extra dependency -------------------------
+def new_totp_secret() -> str:
+    return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
+
+
+def _totp_code(secret_b32: str, when: float, step: int = 30, digits: int = 6) -> str:
+    key = base64.b32decode(secret_b32.upper() + "=" * ((8 - len(secret_b32) % 8) % 8))
+    h = hmac.new(key, struct.pack(">Q", int(when // step)), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    num = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(num).zfill(digits)
+
+
+def verify_totp(secret_b32: str, code: str, window: int = 1) -> bool:
+    """Accept the code for the current 30s step ±`window` steps (clock-skew tolerance)."""
+    if not (secret_b32 and code):
+        return False
+    code = str(code).strip()
+    if not code.isdigit():
+        return False
+    now = time.time()
+    return any(_totp_code(secret_b32, now + w * 30) == code for w in range(-window, window + 1))
+
+
+def totp_uri(username: str, secret_b32: str, issuer: str = "boxcutter") -> str:
+    return (f"otpauth://totp/{quote(issuer + ':' + username)}"
+            f"?secret={secret_b32}&issuer={quote(issuer)}")
 
 
 def hash_token(t: str) -> str:

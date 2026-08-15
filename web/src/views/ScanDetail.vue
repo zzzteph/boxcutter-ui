@@ -1,12 +1,18 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api, apiBase, token } from '../api'
 import { durationLabel, fmtDuration } from '../util'
 import Select from '../components/Select.vue'
 
 const route = useRoute()
+const router = useRouter()
 const id = route.params.id
+
+async function delScan() {
+  if (!confirm(`Delete scan "${scan.value ? scan.value.name : ''}" and all its findings? This can't be undone.`)) return
+  try { await api.del('/scans/' + id); router.push('/scans') } catch (e) { alert(e.message) }
+}
 const JLIMIT = 25, FLIMIT = 25
 const SEVS = ['Critical', 'High', 'Medium', 'Low', 'Info']
 const sevOpts = [{ value: '', label: 'All severities' }, ...SEVS.map(s => ({ value: s, label: s }))]
@@ -132,6 +138,7 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
         <button v-if="['running', 'paused'].includes(scan.status)" class="danger" @click="act('stop')">Stop</button>
         <button class="primary" @click="act('rerun')">Rerun</button>
         <button class="ghost" @click="downloadReport">Report</button>
+        <button class="danger ghost" @click="delScan">Delete</button>
       </div>
     </div>
 

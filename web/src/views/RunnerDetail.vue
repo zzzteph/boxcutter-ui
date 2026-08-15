@@ -1,13 +1,19 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api, isAdmin } from '../api'
 import { fmtDuration, timeAgo } from '../util'
 
 const route = useRoute()
+const router = useRouter()
 const id = route.params.id
 const r = ref(null)
 const admin = isAdmin()
+
+async function delRunner() {
+  if (!confirm(`Remove scanner "${r.value ? (r.value.name || ('runner #' + r.value.id)) : ''}" from the fleet?`)) return
+  try { await api.del('/runners/' + id); router.push('/scanners') } catch (e) { alert(e.message) }
+}
 const conc = ref(null)          // the value in the stepper (initialised from the agent's reported slots)
 let timer = null
 
@@ -33,7 +39,10 @@ onUnmounted(() => clearInterval(timer))
       <h1>{{ r.name || ('runner #' + r.id) }}
         <span class="state" :class="r.status === 'disconnected' ? 'st-stopped' : 'st-done'">{{ r.status }}</span>
       </h1>
-      <router-link to="/scanners" class="btn">← Scanners</router-link>
+      <div class="row" style="gap:8px">
+        <button v-if="admin" class="danger ghost" @click="delRunner">Remove scanner</button>
+        <router-link to="/scanners" class="btn">← Scanners</router-link>
+      </div>
     </div>
     <div class="muted">{{ r.busy_slots }}/{{ r.slots }} slots busy · v{{ r.version || '?' }}
       <span v-if="r.ip"> · <code>{{ r.ip }}</code></span>

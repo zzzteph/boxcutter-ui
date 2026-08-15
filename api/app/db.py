@@ -21,12 +21,15 @@ _ADDED_COLUMNS = [
     ("scan", "vars_json", "TEXT", "'{}'"),
     ("runner", "ip", "VARCHAR(64)", "''"),
     ("runner", "desired_slots", "INTEGER", "NULL"),
+    ("user", "totp_secret", "TEXT", "NULL"),
+    ("user", "totp_enabled", "BOOLEAN", "0"),
 ]
 
 
 def _ensure_columns() -> None:
     from sqlalchemy import inspect
     insp = inspect(engine)
+    prep = engine.dialect.identifier_preparer     # quotes reserved names ("user") correctly per dialect
     try:
         tables = set(insp.get_table_names())
     except Exception:
@@ -43,7 +46,7 @@ def _ensure_columns() -> None:
                 continue
             try:
                 conn.exec_driver_sql(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {sqltype} DEFAULT {default}")
+                    f"ALTER TABLE {prep.quote(table)} ADD COLUMN {prep.quote(column)} {sqltype} DEFAULT {default}")
             except Exception:
                 pass
 

@@ -12,8 +12,10 @@ const mustChange = ref(false)
 const cur = ref('')
 const nw = ref('')
 const nw2 = ref('')
+const code = ref('')
+const needCode = ref(false)
 
-const canLogin = computed(() => username.value.trim() && password.value && !busy.value)
+const canLogin = computed(() => username.value.trim() && password.value && (!needCode.value || code.value) && !busy.value)
 const canChange = computed(() => nw.value.length >= 8 && nw.value === nw2.value && !busy.value)
 
 function friendly(e) {
@@ -27,11 +29,16 @@ async function submit() {
   if (!canLogin.value) return
   err.value = ''; busy.value = true
   try {
-    const res = await api.login(username.value.trim(), password.value)
+    const res = await api.login(username.value.trim(), password.value, needCode.value ? code.value.trim() : undefined)
     setToken(res.token); setUser(res.user)
     if (res.user.must_change_password) { mustChange.value = true; cur.value = password.value; err.value = '' }
     else router.push('/dashboard')
-  } catch (e) { err.value = friendly(e) } finally { busy.value = false }
+  } catch (e) {
+    const m = ((e && e.message) || '').toLowerCase()
+    if (m.includes('2fa_required')) { needCode.value = true; err.value = '' }        // password ok — ask for the code
+    else if (m.includes('2fa')) err.value = 'Invalid authentication code — try again.'
+    else err.value = friendly(e)
+  } finally { busy.value = false }
 }
 async function change() {
   if (!canChange.value) return
@@ -55,6 +62,11 @@ async function change() {
         <input v-model="username" autocomplete="username" autofocus @keyup.enter="submit" />
         <label>Password</label>
         <input v-model="password" type="password" autocomplete="current-password" @keyup.enter="submit" />
+        <template v-if="needCode">
+          <label>Authentication code</label>
+          <input v-model="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" @keyup.enter="submit" />
+          <p class="muted" style="font-size:12px;margin-top:4px">Enter the 6-digit code from your authenticator app.</p>
+        </template>
         <p v-if="err" class="err" role="alert">{{ err }}</p>
         <button class="primary" style="margin-top:16px;width:100%" :disabled="!canLogin" @click="submit">
           {{ busy ? 'Signing in…' : 'Log in' }}

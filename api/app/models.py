@@ -27,6 +27,8 @@ class User(SQLModel, table=True):
     password_hash: str = Field(max_length=255)
     role: str = Field(default="user", max_length=32)          # admin | user | service
     must_change_password: bool = False
+    totp_secret: Optional[str] = Field(default=None, sa_column=Column(Text))   # base32 TOTP secret, server-only
+    totp_enabled: bool = False                                # optional per-user 2FA
     created_at: datetime = Field(default_factory=now)
 
 

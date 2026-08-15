@@ -339,6 +339,26 @@ def set_runner_concurrency(runner_id: int, body: RunnerPatch, admin: User = Depe
     return _runner_row(r)
 
 
+@router.delete("/runners/{runner_id}")
+def delete_runner(runner_id: int, admin: User = Depends(require_admin), session: Session = Depends(get_session)):
+    """Remove a scanner from the fleet (e.g. a stale disconnected one). Any jobs it was mid-flight on are
+    requeued so another agent picks them up. A still-running agent would simply re-enroll as a new row — stop
+    its container (or set its concurrency to 0) to keep it gone."""
+    r = session.get(Runner, runner_id)
+    if not r:
+        raise HTTPException(404)
+    name = r.name or f"runner #{r.id}"
+    for job in session.exec(select(Job).where(
+            Job.runner_id == runner_id, Job.status.in_(["claimed", "running"]))).all():
+        job.status = "pending"
+        job.runner_id = None
+        session.add(job)
+    session.delete(r)
+    session.commit()
+    log_activity(session, "runner_deleted", f"Scanner '{name}' removed", severity="warn")
+    return {"ok": True}
+
+
 _SEV_RANK = ["Critical", "High", "Medium", "Low", "Info"]
 
 

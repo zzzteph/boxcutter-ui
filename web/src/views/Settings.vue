@@ -3,6 +3,7 @@ import { ref, reactive, onMounted } from 'vue'
 import { api, isAdmin, getUser, setUser } from '../api'
 import { timeAgo } from '../util'
 import Select from '../components/Select.vue'
+import QRCode from 'qrcode'
 
 const roleOpts = ['user', 'admin']
 
@@ -97,7 +98,35 @@ async function onTestTelegram() {
   } catch (e) { tg.err = e.message } finally { tg.busy = false }
 }
 
-onMounted(() => { loadUsers(); loadKeys(); loadTelegram() })
+// ---- two-factor auth (self-service, current user) ----
+const twofa = reactive({ enabled: false, setup: false, secret: '', qr: '', code: '', msg: '', err: '', busy: false })
+async function loadTwofa() {
+  try { const r = await api.get('/auth/2fa'); twofa.enabled = r.enabled } catch (e) { /* ignore */ }
+}
+async function startTwofa() {
+  twofa.err = ''; twofa.msg = ''; twofa.busy = true
+  try {
+    const r = await api.post('/auth/2fa/setup', {})
+    twofa.secret = r.secret; twofa.setup = true
+    twofa.qr = await QRCode.toDataURL(r.otpauth_uri, { margin: 1, width: 200 })
+  } catch (e) { twofa.err = e.message } finally { twofa.busy = false }
+}
+async function confirmTwofa() {
+  twofa.err = ''; twofa.busy = true
+  try {
+    await api.post('/auth/2fa/enable', { code: twofa.code.trim() })
+    twofa.enabled = true; twofa.setup = false; twofa.secret = ''; twofa.qr = ''; twofa.code = ''; twofa.msg = '2FA enabled ✓'
+  } catch (e) { twofa.err = e.message } finally { twofa.busy = false }
+}
+async function disableTwofa() {
+  const c = prompt('Enter a current authenticator code to turn off 2FA:')
+  if (!c) return
+  twofa.err = ''; twofa.msg = ''; twofa.busy = true
+  try { await api.post('/auth/2fa/disable', { code: c.trim() }); twofa.enabled = false; twofa.msg = '2FA disabled.' }
+  catch (e) { twofa.err = e.message } finally { twofa.busy = false }
+}
+
+onMounted(() => { loadUsers(); loadKeys(); loadTelegram(); loadTwofa() })
 </script>
 
 <template>
@@ -112,6 +141,32 @@ onMounted(() => { loadUsers(); loadKeys(); loadTelegram() })
     <p v-if="pw.err" style="color:var(--bad)">{{ pw.err }}</p>
     <p v-if="pw.msg" style="color:var(--ok)">{{ pw.msg }}</p>
     <button class="primary" style="margin-top:12px" :disabled="!pw.current || !pw.next" @click="changePw">Update</button>
+  </div>
+
+  <h2>Two-factor authentication</h2>
+  <p class="muted">Protect your account with a TOTP app (Google Authenticator, Authy, 1Password, …).</p>
+  <div class="card" style="max-width:460px;margin:10px 0 18px">
+    <template v-if="twofa.enabled && !twofa.setup">
+      <p><span class="badge sev-Low">On</span> &nbsp;Two-factor is enabled for your account.</p>
+      <button class="danger ghost" :disabled="twofa.busy" @click="disableTwofa">Turn off</button>
+    </template>
+    <template v-else-if="!twofa.setup">
+      <p class="muted">Two-factor is off.</p>
+      <button class="primary" :disabled="twofa.busy" @click="startTwofa">Enable 2FA</button>
+    </template>
+    <template v-else>
+      <p class="muted">Scan this with your authenticator app, then enter the code it shows to confirm.</p>
+      <img v-if="twofa.qr" :src="twofa.qr" alt="2FA QR code" style="width:180px;height:180px;border-radius:8px;background:#fff;padding:6px" />
+      <div class="muted" style="font-size:12px;margin:6px 0">Or type the key manually: <code style="word-break:break-all">{{ twofa.secret }}</code></div>
+      <label>Code from your app</label>
+      <input v-model="twofa.code" inputmode="numeric" placeholder="123456" @keyup.enter="confirmTwofa" />
+      <div class="row" style="gap:8px;margin-top:10px">
+        <button class="primary" :disabled="twofa.busy || !twofa.code" @click="confirmTwofa">Confirm &amp; enable</button>
+        <button class="ghost" @click="twofa.setup = false">Cancel</button>
+      </div>
+    </template>
+    <p v-if="twofa.err" style="color:var(--bad);margin-top:8px">{{ twofa.err }}</p>
+    <p v-if="twofa.msg" style="color:var(--ok);margin-top:8px">{{ twofa.msg }}</p>
   </div>
 
   <h2>API</h2>

@@ -8,7 +8,8 @@ from sqlmodel import Session, select
 
 from ..db import get_session
 from ..models import User
-from ..security import current_user, hash_password, make_jwt, verify_password
+from ..security import (current_user, hash_password, make_jwt, new_totp_secret, totp_uri, verify_password,
+                        verify_totp)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -47,6 +48,11 @@ def _rate_clear(ip: str) -> None:
 class LoginIn(BaseModel):
     username: str
     password: str
+    code: str | None = None          # TOTP code, required when the account has 2FA enabled
+
+
+class CodeIn(BaseModel):
+    code: str
 
 
 class ChangePw(BaseModel):
@@ -69,8 +75,55 @@ def login(body: LoginIn, request: Request, session: Session = Depends(get_sessio
         raise HTTPException(401, "bad credentials")
     if user.role == "service":
         raise HTTPException(403, "service accounts authenticate with an API key, not a password")
+    if user.totp_enabled:                    # password ok; require the 2FA code as a second step
+        if not body.code:
+            raise HTTPException(401, "2fa_required")      # not a failed attempt — the client now asks for a code
+        if not verify_totp(user.totp_secret, body.code):
+            _rate_note_fail(ip)
+            raise HTTPException(401, "invalid 2fa code")
     _rate_clear(ip)                          # a good login resets the counter for this source
     return {"token": make_jwt(user), "user": _user_out(user)}
+
+
+# ---- optional per-user two-factor auth (TOTP) --------------------------------------------------------------
+@router.get("/2fa")
+def twofa_status(user: User = Depends(current_user)):
+    return {"enabled": user.totp_enabled}
+
+
+@router.post("/2fa/setup")
+def twofa_setup(user: User = Depends(current_user), session: Session = Depends(get_session)):
+    """Generate a fresh secret (not enabled until confirmed with a code). Returns the secret + otpauth URI so
+    the UI can render a QR. The secret is only shown here, during setup."""
+    secret = new_totp_secret()
+    user.totp_secret = secret
+    user.totp_enabled = False
+    session.add(user)
+    session.commit()
+    return {"secret": secret, "otpauth_uri": totp_uri(user.username, secret)}
+
+
+@router.post("/2fa/enable")
+def twofa_enable(body: CodeIn, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    if not user.totp_secret:
+        raise HTTPException(400, "start setup first")
+    if not verify_totp(user.totp_secret, body.code):
+        raise HTTPException(400, "invalid code")
+    user.totp_enabled = True
+    session.add(user)
+    session.commit()
+    return {"enabled": True}
+
+
+@router.post("/2fa/disable")
+def twofa_disable(body: CodeIn, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    if user.totp_enabled and not verify_totp(user.totp_secret, body.code):
+        raise HTTPException(400, "invalid code")
+    user.totp_enabled = False
+    user.totp_secret = None
+    session.add(user)
+    session.commit()
+    return {"enabled": False}
 
 
 @router.get("/me")

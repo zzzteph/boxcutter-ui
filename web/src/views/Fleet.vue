@@ -16,6 +16,10 @@ async function bump(r, d) {
   try { await api.patch('/runners/' + r.id, { concurrency: Math.max(0, Math.min(32, cur + d)) }); await load() }
   catch (e) { alert(e.message) }
 }
+async function delRunner(r) {
+  if (!confirm(`Remove scanner "${r.name || ('runner #' + r.id)}" from the fleet?`)) return
+  try { await api.del('/runners/' + r.id); await load() } catch (e) { alert(e.message) }
+}
 async function mkToken() {
   try { const r = await api.post('/enroll-tokens', { label: 'ui' }); newToken.value = r.token }
   catch (e) { alert(e.message) }
@@ -70,7 +74,12 @@ onUnmounted(() => clearInterval(timer))
           <span v-else class="muted">—</span>
         </td>
         <td data-label="Version">v{{ r.version || '?' }}</td>
-        <td data-label="Last beat">{{ timeAgo(r.last_heartbeat) }}</td>
+        <td data-label="Last beat">
+          <div class="row" style="gap:8px;align-items:center;flex-wrap:nowrap;justify-content:space-between">
+            <span>{{ timeAgo(r.last_heartbeat) }}</span>
+            <button v-if="admin" class="danger ghost sm" title="Remove scanner" @click.stop="delRunner(r)">Remove</button>
+          </div>
+        </td>
       </tr>
       <tr v-if="!runners.length"><td colspan="9" class="muted">No scanners connected. Start one and enroll it with a token.</td></tr>
     </tbody>

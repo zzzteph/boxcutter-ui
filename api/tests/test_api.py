@@ -641,6 +641,70 @@ def test_notify_findings_filters_by_severity(monkeypatch):
     assert "Critical" in blob and "http://a" in blob                  # severity + url in the message
 
 
+def test_delete_scan(client):
+    h = auth(login(client))
+    runner = FakeRunner(client, name="del-runner")
+    runner.drain(lambda t: [])
+    tid = _tool_template(client, h, name="del-t")
+    sid = client.post("/scans", json={"name": "to-delete", "template_id": tid,
+                                      "targets": ["a.example.com"]}, headers=h).json()["id"]
+    runner.run_one([{"severity": "high", "title": "F", "url": "http://a", "cls": "c"}])
+    assert client.get(f"/scans/{sid}", headers=h).status_code == 200
+    assert client.get(f"/scans/{sid}/findings", headers=h).json()["total"] >= 1
+    assert client.delete(f"/scans/{sid}", headers=h).json()["ok"] is True
+    assert client.get(f"/scans/{sid}", headers=h).status_code == 404          # scan gone
+    assert client.get(f"/scans/{sid}/findings", headers=h).status_code == 404  # and its findings
+
+
+def test_2fa_totp_flow(client):
+    import time
+    from sqlmodel import Session, select
+    from app.db import engine
+    from app.models import User
+    from app.security import _totp_code
+    h = auth(login(client))
+    try:
+        assert client.get("/auth/2fa", headers=h).json()["enabled"] is False
+        r = client.post("/auth/2fa/setup", headers=h).json()
+        secret = r["secret"]
+        assert secret and r["otpauth_uri"].startswith("otpauth://totp/")
+        assert client.post("/auth/2fa/enable", json={"code": "000000"}, headers=h).status_code == 400   # wrong
+        assert client.post("/auth/2fa/enable", json={"code": _totp_code(secret, time.time())},
+                           headers=h).json()["enabled"] is True
+        # login now needs a code
+        r = client.post("/auth/login", json={"username": "root", "password": "root"})
+        assert r.status_code == 401 and "2fa" in r.json()["detail"].lower()
+        r = client.post("/auth/login", json={"username": "root", "password": "root",
+                                             "code": _totp_code(secret, time.time())})
+        assert r.status_code == 200 and "token" in r.json()
+        # disable -> no code needed again
+        assert client.post("/auth/2fa/disable", json={"code": _totp_code(secret, time.time())},
+                           headers=h).json()["enabled"] is False
+        assert client.post("/auth/login", json={"username": "root", "password": "root"}).status_code == 200
+    finally:
+        with Session(engine) as s:                      # bulletproof cleanup so 2FA never leaks to other tests
+            u = s.exec(select(User).where(User.username == "root")).first()
+            if u:
+                u.totp_enabled = False
+                u.totp_secret = None
+                s.add(u)
+                s.commit()
+
+
+def test_delete_runner(client):
+    h = auth(login(client))
+    runner = FakeRunner(client, name="del-runner-r")
+    runner.heartbeat()
+    assert any(r["id"] == runner.id for r in client.get("/runners", headers=h).json())
+    assert client.delete(f"/runners/{runner.id}", headers=h).json()["ok"] is True
+    assert not any(r["id"] == runner.id for r in client.get("/runners", headers=h).json())
+    # non-admin can't remove scanners
+    client.post("/users", json={"username": "u3", "password": "pw", "role": "user"}, headers=h)
+    uh = auth(login(client, "u3", "pw"))
+    r2 = FakeRunner(client, name="del-runner-r2")
+    assert client.delete(f"/runners/{r2.id}", headers=uh).status_code in (401, 403)
+
+
 def test_llm_profile_patch_sets_key(client):
     h = auth(login(client))
     pid = client.post("/llm-profiles", json={"name": "patch-me", "provider": "anthropic"}, headers=h).json()["id"]
