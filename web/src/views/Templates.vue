@@ -4,23 +4,80 @@ import { api, isAdmin } from '../api'
 import Select from '../components/Select.vue'
 
 const KIND_LABEL = { tool: 'Tool', workflow: 'Workflow', ai_agent: 'AI agent' }
-// Known boxcutter workflows/tools/agents, with a one-line description, so the picker is self-explanatory.
+// The real stock boxcutter catalog (boxcutter --list-all / workflow --list / ai --list), with one-line
+// descriptions so the picker is self-explanatory.
 const CATALOG = {
-  workflow: [
-    { name: 'web-full', desc: 'Full web-application assessment' },
-    { name: 'recon', desc: 'Reconnaissance / asset discovery' },
-  ],
   tool: [
-    { name: 'httpx', desc: 'HTTP probing & tech detection' },
-    { name: 'nuclei', desc: 'Template-based vulnerability scan' },
-    { name: 'sqlmap', desc: 'SQL-injection testing' },
-    { name: 'fuzz', desc: 'Content / parameter fuzzing' },
+    { name: 'subfinder', desc: 'Discover subdomains (Subfinder)' },
+    { name: 'dnsx', desc: 'Resolve / brute-force DNS, filter wildcards' },
+    { name: 'httpx', desc: 'Probe live HTTP services & tech' },
+    { name: 'api-map', desc: 'Method-aware API path discovery' },
+    { name: 'smart-enum', desc: 'Context-aware candidate path list' },
+    { name: 'screenshot', desc: 'Screenshot a URL (headless chromium)' },
+    { name: 'wayback', desc: 'Historical URLs from web archives' },
+    { name: 'wayback-domains', desc: 'Wayback unique host list for a domain' },
+    { name: 'katana-crawl', desc: 'Crawl a URL with Katana' },
+    { name: 'zap-crawl', desc: 'Crawl with ZAP spider + AJAX' },
+    { name: 'js-endpoints', desc: 'Extract API endpoints from a JS file' },
+    { name: 'browser-crawl', desc: 'Headless-browser crawl (routes + XHR/fetch)' },
+    { name: 'browser-login', desc: 'Log in via a real browser, return session' },
+    { name: 'browser-actions', desc: 'Scripted headless-browser actions' },
+    { name: 'visual-driver', desc: 'Drive a browser by screen coordinates' },
+    { name: 'vision-verify', desc: 'Confirm JS execution (reflected/DOM XSS)' },
+    { name: 'nuclei', desc: 'Nuclei vulnerability scan' },
+    { name: 'sqlmap', desc: 'SQL-injection testing (sqlmap)' },
+    { name: 'blind-oracle', desc: 'Blind SQLi / command-injection probes' },
+    { name: 'bola-walk', desc: 'BOLA/IDOR cross-account authz diff' },
+    { name: 'mass-assign', desc: 'Mass-assignment detection' },
+    { name: 'dirb', desc: 'Directory brute-force (dirb)' },
+    { name: 'dirsearch', desc: 'Directory brute-force (dirsearch)' },
+    { name: 'zap-scan-url', desc: 'ZAP active scan of one URL' },
+    { name: 'zap-scan-full', desc: 'Full ZAP scan (spider + AJAX + active)' },
+    { name: 'zap-scan-openapi', desc: 'ZAP active scan from an OpenAPI spec' },
+    { name: 'path-fuzz', desc: 'Brute-force a FUZZ position in a URL' },
+    { name: 'path-bust', desc: 'Directory brute-force under a path' },
+    { name: 'fuzz', desc: 'Fuzz params/path/body for injection' },
+    { name: 'scan-secrets', desc: 'Scan a response for exposed secrets' },
+    { name: 'git-extract', desc: 'Extract source from an exposed .git' },
+    { name: 'swagger-parser', desc: 'Parse an OpenAPI/Swagger spec' },
+    { name: 'swagger-endpoints', desc: 'List endpoints from a spec' },
+    { name: 'swagger-specs', desc: 'Find OpenAPI/Swagger spec URLs' },
+    { name: 'graphql-detect', desc: 'Find GraphQL endpoints' },
+    { name: 'graphql-audit', desc: 'Audit a GraphQL endpoint' },
+    { name: 'http-request', desc: 'Make a raw HTTP request' },
+  ],
+  workflow: [
+    { name: 'endpoint-scan', desc: 'DAST one endpoint (fuzz + nuclei + sqlmap + zap)' },
+    { name: 'env-nuclei', desc: 'subfinder → nuclei across the env' },
+    { name: 'env-scan', desc: 'Enumerate subdomains, then web-full each' },
+    { name: 'env-secrets', desc: 'Subdomains → crawl + secrets each host' },
+    { name: 'env-takeover', desc: 'Subfinder → subdomain-takeover checks' },
+    { name: 'env-wayback-secrets', desc: 'Subfinder → secrets on every subdomain' },
+    { name: 'env-wayback', desc: 'Subfinder → wayback → endpoint-scan' },
+    { name: 'graphql-scan', desc: 'Find + audit GraphQL endpoints' },
+    { name: 'recon-http', desc: 'Recon, then live HTTP(S) services' },
+    { name: 'recon', desc: 'Subdomains (subfinder + wayback), resolved' },
+    { name: 'secrets-scan', desc: 'Gather JS, scan for secrets' },
+    { name: 'swagger-fuzz', desc: 'Find spec(s), fuzz every endpoint' },
+    { name: 'swagger-scan', desc: 'Find spec(s), DAST every endpoint' },
+    { name: 'wayback-fuzz', desc: 'Wayback URLs → fuzz with your payload' },
+    { name: 'wayback-scan', desc: 'Wayback URLs → sqlmap/fuzz/zap' },
+    { name: 'web-crawl', desc: 'Katana + ZAP crawl, merged' },
+    { name: 'web-full', desc: 'Probe liveness, then full web DAST' },
+    { name: 'web-fuzz', desc: 'Web DAST, fuzz-only injection' },
+    { name: 'web-nuclei', desc: 'Nuclei template passes on one URL' },
+    { name: 'web-scan', desc: 'Full DAST of a known URL' },
+    { name: 'web-sqlmap', desc: 'Web DAST, sqlmap-only injection' },
   ],
   ai_agent: [
-    { name: 'irvin', desc: 'Web pentest agent' },
-    { name: 'bob', desc: 'Recon & mapping agent' },
-    { name: 'travis', desc: 'API testing agent' },
-    { name: 'caleb', desc: 'Exploitation agent' },
+    { name: 'irvin', desc: 'Pipeline bug-hunter (LLM)' },
+    { name: 'logio', desc: 'Agentic login (auth only)' },
+    { name: 'prawlio', desc: 'Authenticated crawl (login + crawl)' },
+    { name: 'crawlio', desc: 'Code-verified endpoint crawler' },
+    { name: 'juicy', desc: 'JS analyst (hidden URLs, DOM XSS, secrets)' },
+    { name: 'bob', desc: 'Short surface scanner' },
+    { name: 'travis', desc: 'Recon triage (rate a host)' },
+    { name: 'caleb', desc: 'Multi-phase / multi-identity orchestrator' },
   ],
 }
 const CUSTOM = '__custom__'
@@ -52,8 +109,10 @@ function specTokens(spec) {
   for (const f of (spec?.flags || [])) out.push(String(f))
   return out
 }
-const preview = computed(() => ['boxcutter', resolvedSpec.value,
-  ...specTokens({ params: form.params })].filter(Boolean).join(' '))
+const preview = computed(() => {
+  const sub = form.kind === 'workflow' ? ['workflow'] : form.kind === 'ai_agent' ? ['ai'] : []
+  return ['boxcutter', ...sub, resolvedSpec.value, ...specTokens({ params: form.params })].filter(Boolean).join(' ')
+})
 
 // when the kind changes, default the picker to that kind's first known item, and suggest a name
 watch(() => form.kind, (k) => { form.specName = (CATALOG[k][0] || {}).name || CUSTOM })

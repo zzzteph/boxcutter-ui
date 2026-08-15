@@ -85,7 +85,7 @@ def test_ai_agent_secret_delivery_and_no_leak(client):
     res = runner.claim()
     job = res["job"]
     argv = job["argv"]
-    assert argv[:2] == ["irvin", "example.com"]
+    assert argv[:3] == ["ai", "irvin", "example.com"]         # `boxcutter ai <agent> <target>`
     assert "--provider" in argv and argv[argv.index("--provider") + 1] == "anthropic"
     assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-x"
     assert "--context" in argv and argv[argv.index("--context") + 1] == "focus on auth"
@@ -703,6 +703,20 @@ def test_delete_runner(client):
     uh = auth(login(client, "u3", "pw"))
     r2 = FakeRunner(client, name="del-runner-r2")
     assert client.delete(f"/runners/{r2.id}", headers=uh).status_code in (401, 403)
+
+
+def test_build_argv_subcommand_by_kind():
+    import json as _json
+    from app.routers.runners import build_argv
+
+    class _T:
+        def __init__(self, kind, name):
+            self.kind, self.context, self.llm_profile_id = kind, None, None
+            self.spec_json = _json.dumps({"name": name, "params": []})
+
+    assert build_argv(None, _T("tool", "httpx"), "example.com")[0] == ["httpx", "example.com"]
+    assert build_argv(None, _T("workflow", "web-full"), "example.com")[0] == ["workflow", "web-full", "example.com"]
+    assert build_argv(None, _T("ai_agent", "irvin"), "example.com")[0] == ["ai", "irvin", "example.com"]
 
 
 def test_llm_profile_patch_sets_key(client):

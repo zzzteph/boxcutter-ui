@@ -36,7 +36,8 @@ function specTokens(spec) {
 const preview = computed(() => {
   const t = selTmpl.value
   if (!t) return ''
-  const parts = ['boxcutter', t.spec?.name, ...specTokens(t.spec)]
+  const sub = t.kind === 'workflow' ? ['workflow'] : t.kind === 'ai_agent' ? ['ai'] : []
+  const parts = ['boxcutter', ...sub, t.spec?.name, ...specTokens(t.spec)]
   if (isAgent.value) {
     const ctx = vars.context.trim() || t.context || ''
     if (ctx) parts.push('--context', q(ctx))

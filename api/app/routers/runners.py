@@ -59,7 +59,14 @@ def build_argv(session: Session, tmpl: Template, target: str, scan: Scan | None 
     same for every scan that uses the template; the scan's vars (context/creds/custom) are per-scan."""
     spec = json.loads(tmpl.spec_json or "{}")
     name = spec.get("name", "")
-    argv = [name, target]
+    # the engine is `boxcutter <tool> <target>`, `boxcutter workflow <name> <target>`, or
+    # `boxcutter ai <agent> <target>` — prefix the right subcommand for the template's kind.
+    if tmpl.kind == "workflow":
+        argv = ["workflow", name, target]
+    elif tmpl.kind == "ai_agent":
+        argv = ["ai", name, target]
+    else:
+        argv = [name, target]
     secrets_env: dict = {}
     vars_: dict = {}
     if scan is not None:

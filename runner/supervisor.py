@@ -14,6 +14,8 @@ Config precedence: local file (.runner-config.json, written by the UI) over envi
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -424,18 +426,27 @@ def heartbeat_loop() -> None:
 _SESSION = {"token": None}
 
 
+def _hash_pw(pw: str) -> str:
+    salt = os.urandom(8).hex()
+    return f"{salt}${hashlib.pbkdf2_hmac('sha256', pw.encode(), salt.encode(), 100_000).hex()}"
+
+
+def _check_pw(pw: str, stored: str) -> bool:
+    try:
+        salt, dk = stored.split("$", 1)
+        return hmac.compare_digest(hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100_000).hex(), dk)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _validate_login(username: str, password: str) -> bool:
-    """root/root is the local bootstrap/recovery login (the UI binds to localhost). Any other credentials are
-    validated against the boxcutter-server's /auth/login - i.e. the server is the identity provider."""
-    if username == "root" and password == "root":
-        return True
-    if CFG.get("server_url"):
-        try:
-            _req("POST", "/auth/login", {"username": username, "password": password}, timeout=8)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-    return False
+    """Local, self-contained login for the agent's own control UI. The single account is 'root'; its password
+    defaults to 'root' and can be changed here (stored hashed in the config). The agent NEVER delegates its
+    login to the server — a scanner stays manageable no matter the server's state or credentials."""
+    if username != "root":
+        return False
+    stored = CFG.get("ui_password_hash")
+    return _check_pw(password, stored) if stored else (password == "root")
 
 
 # Material Design 3 (dark) — same theme/tokens as the boxcutter-server SPA, so the two UIs match.
@@ -472,8 +483,8 @@ _LOGIN_HTML = ("<!doctype html><meta charset=utf-8><meta name=viewport content='
                "<label>Username</label><input id=u value=root>"
                "<label>Password</label><input id=p type=password onkeyup='if(event.key==\"Enter\")login()'>"
                "<p id=err class=bad></p><button style='width:100%' onclick=login()>Log in</button>"
-               "<p class=muted style='font-size:12px'>First run: <b>root/root</b>. After a server is set, use your "
-               "boxcutter-server account.</p></div></div><script>"
+               "<p class=muted style='font-size:12px'>Default login: <b>root / root</b> — change it below after "
+               "signing in. This login is local to the scanner, not the server.</p></div></div><script>"
                "async function login(){let r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},"
                "body:JSON.stringify({username:u.value,password:p.value})});"
                "if(r.ok)location.reload();else document.getElementById('err').textContent='invalid credentials';}"
@@ -493,6 +504,11 @@ _DASH_HTML = ("<!doctype html><meta charset=utf-8><meta name=viewport content='w
               "<div class=row style='justify-content:flex-start;gap:8px'>"
               "<button onclick=save()>Save &amp; connect</button>"
               "<button class=ghost id=drainbtn onclick=drain()>Pause (drain)</button></div></div>"
+              "<div class=card><h2>Agent password</h2>"
+              "<div class=muted style='font-size:12px'>The scanner's own login (default root/root). Independent of the server.</div>"
+              "<label>New password</label><input id=newpw type=password placeholder='at least 4 characters'>"
+              "<div class=row style='justify-content:flex-start;gap:8px;margin-top:8px'>"
+              "<button onclick=setpw()>Update password</button><span id=pwmsg class=muted></span></div></div>"
               "<div class=card><h2>Running now</h2><div id=slots class=muted>idle</div></div>"
               "<div class=card><h2>Recent jobs</h2><div id=recent class=muted>none yet</div></div>"
               "</div><script>"
@@ -511,6 +527,9 @@ _DASH_HTML = ("<!doctype html><meta charset=utf-8><meta name=viewport content='w
               "async function save(){await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},"
               "body:JSON.stringify({server_url:server.value,enroll_token:token.value,concurrency:parseInt(conc.value||'0')})});_filled=false;refresh();}"
               "async function logout(){await fetch('/logout',{method:'POST'});location.reload();}"
+              "async function setpw(){let r=await fetch('/set-password',{method:'POST',headers:{'Content-Type':'application/json'},"
+              "body:JSON.stringify({new_password:newpw.value})});"
+              "document.getElementById('pwmsg').textContent=r.ok?'\\u2713 updated':'too short (min 4)';newpw.value='';}"
               "setInterval(refresh,2000);refresh();</script>")
 
 
@@ -568,6 +587,13 @@ class Handler(BaseHTTPRequestHandler):
                                                                "concurrency", "username", "password", "name")})
             save_config(CFG)
             enroll()
+            return self._send(200, json.dumps({"ok": True}))
+        if self.path == "/set-password":
+            new = str(self._json_body().get("new_password", ""))
+            if len(new) < 4:
+                return self._send(400, json.dumps({"ok": False, "error": "password too short"}))
+            CFG["ui_password_hash"] = _hash_pw(new)
+            save_config(CFG)
             return self._send(200, json.dumps({"ok": True}))
         self._send(404, "{}")
 

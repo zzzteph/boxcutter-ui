@@ -55,3 +55,18 @@ def test_run_job_missing_engine_is_reported_not_crashed():
     sup.BOXCUTTER_CMD = ["definitely-not-a-real-binary-xyz-123"]
     out = sup.run_job({"id": 1, "argv": [], "target": "x"}, {})
     assert out["error"] and "not found" in out["error"]
+
+
+def test_agent_login_is_local_and_settable():
+    """The agent UI login is self-contained (root + a settable local password) and never delegates to the
+    server — so a scanner stays manageable regardless of the server's credentials/state."""
+    sup = _load_supervisor()
+    assert sup._validate_login("root", "root") is True          # default
+    assert sup._validate_login("root", "nope") is False
+    assert sup._validate_login("admin", "root") is False        # only 'root' locally
+    sup.CFG["ui_password_hash"] = sup._hash_pw("s3cret!")        # set a password -> default stops working
+    assert sup._validate_login("root", "root") is False
+    assert sup._validate_login("root", "s3cret!") is True
+    sup.CFG["server_url"] = "http://example.com:8000"            # a configured server must NOT change the login
+    assert sup._validate_login("root", "s3cret!") is True
+    assert sup._validate_login("root", "server-only-cred") is False

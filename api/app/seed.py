@@ -13,10 +13,18 @@ from .db import engine
 from .models import EnrollToken, LLMProfile, NotifySettings, Template, User
 from .security import hash_password, hash_token
 
-# Starter templates. Workflows/tools are the stock boxcutter names; extend these lists to add more.
-WORKFLOWS = ["web-full", "recon"]
-TOOLS = ["httpx", "nuclei", "sqlmap", "fuzz"]
-AGENTS = ["irvin", "bob", "travis", "caleb"]
+# Starter templates — the real stock boxcutter catalog (boxcutter --list-all / workflow --list / ai --list).
+TOOLS = ["subfinder", "dnsx", "httpx", "api-map", "smart-enum", "screenshot", "wayback", "wayback-domains",
+         "katana-crawl", "zap-crawl", "js-endpoints", "browser-crawl", "browser-login", "browser-actions",
+         "visual-driver", "vision-verify", "nuclei", "sqlmap", "blind-oracle", "bola-walk", "mass-assign",
+         "dirb", "dirsearch", "zap-scan-url", "zap-scan-full", "zap-scan-openapi", "path-fuzz", "path-bust",
+         "fuzz", "scan-secrets", "git-extract", "swagger-parser", "swagger-endpoints", "swagger-specs",
+         "graphql-detect", "graphql-audit", "http-request"]
+WORKFLOWS = ["endpoint-scan", "env-nuclei", "env-scan", "env-secrets", "env-takeover", "env-wayback-secrets",
+             "env-wayback", "graphql-scan", "recon-http", "recon", "secrets-scan", "swagger-fuzz",
+             "swagger-scan", "wayback-fuzz", "wayback-scan", "web-crawl", "web-full", "web-fuzz", "web-nuclei",
+             "web-scan", "web-sqlmap"]
+AGENTS = ["irvin", "logio", "prawlio", "crawlio", "juicy", "bob", "travis", "caleb"]
 DEMO_PROFILE = "demo (set an API key)"
 
 

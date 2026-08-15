@@ -33,9 +33,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
 # ---- target: boxcutter-agent (the scanner) ----
 FROM ghcr.io/zzzteph/boxcutter:latest AS agent
 COPY runner/supervisor.py /supervisor.py
-# How the supervisor invokes the engine. If `boxcutter` is not a bare command on PATH in the image, set this to
-# the real invocation (e.g. "python3 /app/boxcutter.py") — verify against the image and adjust.
-ENV BOXCUTTER_CMD=boxcutter \
+# The engine is not a bare `boxcutter` command — the base image runs it via python (its ENTRYPOINT is
+# `python3 /opt/boxcutter/boxcutter.py`). Point the supervisor at that. Override BOXCUTTER_CMD if a future base
+# image moves it.
+ENV BOXCUTTER_CMD="python3 /opt/boxcutter/boxcutter.py" \
     RUNNER_UI_PORT=7070 \
     RUNNER_CONFIG=/data/runner-config.json
 VOLUME ["/data"]
@@ -56,7 +57,7 @@ VOLUME ["/app/data"]
 # if it doesn't, use the two separate images instead. amd64 only (the engine base is amd64).
 FROM ghcr.io/zzzteph/boxcutter:latest AS standalone
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app BOXCUTTER_CMD=boxcutter CONCURRENCY=4 RUNNER_UI_PORT=7070
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app BOXCUTTER_CMD="python3 /opt/boxcutter/boxcutter.py" CONCURRENCY=4 RUNNER_UI_PORT=7070
 # The engine's base marks the system python "externally managed" (PEP 668), so install the server deps into
 # their own venv. The launcher runs uvicorn + the supervisor from this venv; the `boxcutter` engine keeps using
 # its own on-PATH install.
