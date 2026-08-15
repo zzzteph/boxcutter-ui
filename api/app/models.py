@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, Text
+from sqlalchemy import Column, Index, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -74,7 +74,7 @@ class Scan(SQLModel, table=True):
     name: str = Field(max_length=255)
     owner_id: int = Field(foreign_key="user.id", index=True)
     template_id: int = Field(foreign_key="template.id")
-    status: str = Field(default="draft", max_length=24)       # draft|queued|running|paused|stopped|done
+    status: str = Field(default="draft", index=True, max_length=24)   # draft|queued|running|paused|stopped|done
     run_no: int = 0
     vars_json: str = _text("{}")                             # scan-specific inputs: {context, creds, custom:[{key,value}]}
     authorized_ack_at: Optional[datetime] = None
@@ -97,13 +97,15 @@ class Target(SQLModel, table=True):
 
 
 class Job(SQLModel, table=True):
+    # composite index for the fair-claim + per-scan status counts (hot path at hundreds of thousands of jobs)
+    __table_args__ = (Index("ix_job_scan_status_created", "scan_id", "status", "created_at"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     scan_id: int = Field(foreign_key="scan.id", index=True)
     target_id: int = Field(foreign_key="target.id")
     template_id: int = Field(foreign_key="template.id")
     run_no: int = 0
     dedup_key: str = Field(index=True, unique=True, max_length=128)
-    status: str = Field(default="pending", max_length=24)     # pending|claimed|running|done|failed|cancelled
+    status: str = Field(default="pending", index=True, max_length=24)  # pending|claimed|running|done|failed|cancelled
     runner_id: Optional[int] = Field(default=None, foreign_key="runner.id")
     attempts: int = 0
     argv_json: str = _text("[]")                             # the exact boxcutter command run for this target
@@ -115,6 +117,9 @@ class Job(SQLModel, table=True):
 
 
 class Finding(SQLModel, table=True):
+    # (scan_id, fingerprint) speeds the per-result diff upsert; (scan_id, severity) speeds the sorted findings list
+    __table_args__ = (Index("ix_finding_scan_fp", "scan_id", "fingerprint"),
+                      Index("ix_finding_scan_sev", "scan_id", "severity"))
     id: Optional[int] = Field(default=None, primary_key=True)
     scan_id: int = Field(foreign_key="scan.id", index=True)
     target: str = Field(default="", max_length=1024)
@@ -132,15 +137,6 @@ class Finding(SQLModel, table=True):
     raw_json: str = _text("{}")
 
 
-class FindingEvent(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    scan_id: int = Field(foreign_key="scan.id", index=True)
-    finding_id: Optional[int] = Field(default=None, foreign_key="finding.id")
-    run_no: int = 0
-    kind: str = Field(default="", max_length=24)              # new | reopened | resolved | still_open
-    at: datetime = Field(default_factory=now)
-
-
 class JobEvent(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     job_id: int = Field(foreign_key="job.id", index=True)
@@ -150,7 +146,7 @@ class JobEvent(SQLModel, table=True):
     agent: str = Field(default="", max_length=64)
     line: str = _text("")
     reasoning: Optional[str] = Field(default=None, sa_column=Column(Text))
-    at: datetime = Field(default_factory=now)
+    at: datetime = Field(default_factory=now, index=True)     # indexed for age-based log retention pruning
 
 
 class Runner(SQLModel, table=True):
@@ -160,7 +156,8 @@ class Runner(SQLModel, table=True):
     ip: str = Field(default="", max_length=64)                # the agent host's IP, reported at enroll/heartbeat
     version: str = Field(default="", max_length=40)
     status: str = Field(default="idle", max_length=24)        # idle | busy | disconnected (from last_heartbeat)
-    slots: int = 1
+    slots: int = 1                                            # concurrency the agent currently reports
+    desired_slots: Optional[int] = None                       # concurrency the server is asking the agent to adopt
     busy_slots: int = 0
     current_jobs_json: str = _text("[]")
     metrics_json: str = _text("{}")                          # {"cpu": pct, "mem": pct} from the runner heartbeat
@@ -177,6 +174,16 @@ class Activity(SQLModel, table=True):
     scan_id: Optional[int] = Field(default=None, foreign_key="scan.id", index=True)
     runner_id: Optional[int] = Field(default=None, foreign_key="runner.id")
     severity: str = Field(default="info", max_length=16)      # info | warn | critical
+
+
+class NotifySettings(SQLModel, table=True):
+    """Singleton (id=1) — Telegram notification config. The bot token is a server-only secret (never serialized
+    to the browser), like LLM api keys."""
+    id: Optional[int] = Field(default=1, primary_key=True)
+    telegram_enabled: bool = False
+    telegram_token: str = _text("")                          # secret, server-only
+    telegram_chat_id: str = Field(default="", max_length=64)
+    severities_json: str = _text('["Critical", "High"]')     # which finding severities to send
 
 
 class EnrollToken(SQLModel, table=True):

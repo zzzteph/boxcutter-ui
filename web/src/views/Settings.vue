@@ -64,7 +64,40 @@ async function createSys() {
   catch (e) { alert(e.message) }
 }
 
-onMounted(() => { loadUsers(); loadKeys() })
+// ---- Telegram notifications (admin) ----
+const TG_SEVS = ['Critical', 'High', 'Medium', 'Low', 'Info']
+const tg = reactive({ enabled: false, chat_id: '', token: '', has_token: false,
+  severities: { Critical: true, High: true, Medium: false, Low: false, Info: false }, msg: '', err: '', busy: false })
+async function loadTelegram() {
+  if (!admin) return
+  try {
+    const r = await api.get('/notify/telegram')
+    tg.enabled = r.enabled; tg.chat_id = r.chat_id || ''; tg.has_token = r.has_token
+    for (const s of TG_SEVS) tg.severities[s] = r.severities.includes(s)
+  } catch (e) { /* ignore */ }
+}
+async function saveTelegram() {
+  tg.msg = ''; tg.err = ''
+  const body = { enabled: tg.enabled, chat_id: tg.chat_id, severities: TG_SEVS.filter(s => tg.severities[s]) }
+  if (tg.token) body.token = tg.token
+  const r = await api.post('/notify/telegram', body)
+  tg.has_token = r.has_token; tg.token = ''
+}
+async function onSaveTelegram() {
+  tg.busy = true
+  try { await saveTelegram(); tg.msg = 'Saved.' } catch (e) { tg.err = e.message } finally { tg.busy = false }
+}
+async function onTestTelegram() {
+  tg.msg = ''; tg.err = ''; tg.busy = true
+  try {
+    await saveTelegram()                         // persist current values, then test them
+    const r = await api.post('/notify/telegram/test', {})
+    if (r.ok) tg.msg = 'Test message sent ✓'
+    else tg.err = 'Test failed: ' + (r.error || 'unknown')
+  } catch (e) { tg.err = e.message } finally { tg.busy = false }
+}
+
+onMounted(() => { loadUsers(); loadKeys(); loadTelegram() })
 </script>
 
 <template>
@@ -114,6 +147,30 @@ onMounted(() => { loadUsers(); loadKeys() })
   </div>
 
   <template v-if="admin">
+    <h2 style="margin-top:18px">Telegram notifications</h2>
+    <p class="muted">Send a Telegram message for each new finding of the selected severities. The message is just
+      severity + short info + URL. The bot token is stored server-side and never shown again.</p>
+    <div class="card" style="margin:10px 0;max-width:640px">
+      <label class="row" style="margin:2px 0;gap:8px;width:auto"><input type="checkbox" v-model="tg.enabled" style="width:auto" /> <span>Enabled</span></label>
+      <label>Chat ID</label>
+      <input v-model="tg.chat_id" placeholder="e.g. 123456789 or -1001234567890" />
+      <label>Bot token</label>
+      <input v-model="tg.token" type="password" autocomplete="new-password"
+        :placeholder="tg.has_token ? '•••••• configured — leave blank to keep' : '123456:ABC-DEF…'" />
+      <label>Send which severities</label>
+      <div class="row" style="gap:16px">
+        <label v-for="s in TG_SEVS" :key="s" class="row" style="width:auto;margin:0;gap:6px;text-transform:none">
+          <input type="checkbox" v-model="tg.severities[s]" style="width:auto" /> <span>{{ s }}</span>
+        </label>
+      </div>
+      <p v-if="tg.err" style="color:var(--bad);margin-top:8px">{{ tg.err }}</p>
+      <p v-if="tg.msg" style="color:var(--ok);margin-top:8px">{{ tg.msg }}</p>
+      <div class="row" style="gap:8px;margin-top:12px">
+        <button class="primary" :disabled="tg.busy" @click="onSaveTelegram">Save</button>
+        <button class="tonal" :disabled="tg.busy" @click="onTestTelegram">Send test</button>
+      </div>
+    </div>
+
     <h2>Users</h2>
     <div class="card" style="margin:10px 0">
       <div class="row" style="gap:12px;align-items:flex-end">

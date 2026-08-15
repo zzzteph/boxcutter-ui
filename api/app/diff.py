@@ -7,9 +7,10 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
+from sqlalchemy import func, update
 from sqlmodel import Session, select
 
-from .models import Finding, FindingEvent
+from .models import Finding
 
 # Informational reconnaissance / reachability items (e.g. "host reachable") are not issues and must not render
 # as findings.
@@ -56,8 +57,8 @@ def fingerprint(target: str, kind: str, cls: str, severity: str, url: str, title
 def upsert_finding(session: Session, scan_id: int, kind: str, target: str, f: dict,
                    run_no: int = 0) -> tuple[str, bool]:
     """Insert or refresh a finding from one engine-envelope item; returns (fingerprint, created). A resolved
-    finding that shows up again flips back to open (a 'reopened' event). A brand-new fingerprint gets a 'new'
-    event. `last_seen` is bumped on every sighting - reconcile uses it to decide what this run saw."""
+    finding that shows up again flips back to open. `last_seen` is bumped on every sighting — reconcile uses it
+    to decide what this run saw. The (scan_id, fingerprint) lookup is indexed for fast ingestion at scale."""
     fp = fingerprint(target, kind, f.get("cls", ""), f.get("severity", ""), f.get("url", ""), f.get("title", ""))
     now = datetime.now(timezone.utc)
     existing = session.exec(select(Finding).where(
@@ -67,58 +68,45 @@ def upsert_finding(session: Session, scan_id: int, kind: str, target: str, f: di
         existing.last_seen = now
         existing.raw_json = raw
         if existing.state == "resolved":
-            existing.state = "open"
-            session.add(FindingEvent(scan_id=scan_id, finding_id=existing.id, run_no=run_no, kind="reopened"))
+            existing.state = "open"           # a resolved finding seen again reopens
         session.add(existing)
         session.commit()
         return fp, False
-    else:
-        finding = Finding(
-            scan_id=scan_id, target=target, fingerprint=fp, template_kind=kind,
-            severity=str(f.get("severity", "info")).title(), title=str(f.get("title", ""))[:300],
-            url=f.get("url", ""),
-            evidence=str(f.get("evidence", ""))[:2000], reproduce=str(f.get("reproduce", ""))[:2000],
-            raw_json=raw, state="new", first_seen=now, last_seen=now)
-        finding.cls = str(f.get("cls", "")).lower()   # 'cls' can't be a constructor kwarg (shadows __new__)
-        session.add(finding)
-        session.commit()
-        session.refresh(finding)
-        session.add(FindingEvent(scan_id=scan_id, finding_id=finding.id, run_no=run_no, kind="new"))
-        session.commit()
-        return fp, True
+    finding = Finding(
+        scan_id=scan_id, target=target, fingerprint=fp, template_kind=kind,
+        severity=str(f.get("severity", "info")).title(), title=str(f.get("title", ""))[:300],
+        url=f.get("url", ""),
+        evidence=str(f.get("evidence", ""))[:2000], reproduce=str(f.get("reproduce", ""))[:2000],
+        raw_json=raw, state="new", first_seen=now, last_seen=now)
+    finding.cls = str(f.get("cls", "")).lower()   # 'cls' can't be a constructor kwarg (shadows __new__)
+    session.add(finding)
+    session.commit()
+    return fp, True
 
 
 def reconcile_run(session: Session, scan_id: int, run_no: int, cutoff: datetime | None) -> dict:
     """Reconcile a scan's findings after a run whose jobs started at `cutoff` (the scan's last_run_at).
 
-    - seen this run (last_seen >= cutoff), first appeared this run (first_seen >= cutoff) -> ``new``
-    - seen this run, but first seen in an earlier run                                     -> ``open``
-    - not seen this run                                                                   -> ``resolved``
+    - not seen this run (last_seen < cutoff)            -> ``resolved``
+    - seen this run, carried over from an earlier run   -> ``open``
+    - seen this run, first appeared this run            -> ``new`` (already set at insert time)
 
-    A FindingEvent is written for every actual state change. Returns a {new, open, resolved} tally.
+    Entirely set-based (a couple of bulk UPDATEs + COUNTs) so it never loads the finding rows — it stays fast
+    even on a scan with hundreds of thousands of findings, and won't block the agent's result request.
     """
-    cutoff = _aware(cutoff)
-    stats = {"new": 0, "open": 0, "resolved": 0}
-    for f in session.exec(select(Finding).where(Finding.scan_id == scan_id)).all():
-        last_seen = _aware(f.last_seen)
-        first_seen = _aware(f.first_seen)
-        seen = last_seen is not None and (cutoff is None or last_seen >= cutoff)
-        if seen:
-            is_new = cutoff is not None and first_seen is not None and first_seen >= cutoff
-            new_state = "new" if is_new else "open"
-            if f.state != new_state:
-                # new -> open is the normal "carried over" transition; anything -> open after being
-                # resolved was already flagged 'reopened' at upsert time.
-                if new_state == "open" and f.state == "new":
-                    session.add(FindingEvent(scan_id=scan_id, finding_id=f.id, run_no=run_no, kind="still_open"))
-                f.state = new_state
-                session.add(f)
-            stats[new_state] += 1
-        else:
-            if f.state != "resolved":
-                f.state = "resolved"
-                session.add(f)
-                session.add(FindingEvent(scan_id=scan_id, finding_id=f.id, run_no=run_no, kind="resolved"))
-            stats["resolved"] += 1
-    session.commit()
-    return stats
+    cut = _aware(cutoff)
+    cut = cut.replace(tzinfo=None) if cut else None       # compare naive-UTC to the stored naive-UTC datetimes
+    if cut is not None:
+        session.execute(update(Finding).where(
+            Finding.scan_id == scan_id, Finding.state != "resolved", Finding.last_seen < cut
+        ).values(state="resolved"))                       # findings not seen this run -> resolved
+        session.execute(update(Finding).where(
+            Finding.scan_id == scan_id, Finding.state == "new",
+            Finding.last_seen >= cut, Finding.first_seen < cut
+        ).values(state="open"))                           # carried-over findings seen again -> open
+        session.commit()
+
+    def _count(state: str) -> int:
+        return session.exec(select(func.count()).select_from(Finding).where(
+            Finding.scan_id == scan_id, Finding.state == state)).one()
+    return {"new": _count("new"), "open": _count("open"), "resolved": _count("resolved")}

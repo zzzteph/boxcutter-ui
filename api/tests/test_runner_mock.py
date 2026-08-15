@@ -31,3 +31,27 @@ def test_scrub_redacts_secrets():
     sup = _load_supervisor()
     out = sup._scrub("Authorization: Bearer sk-super-secret-123 done", ["sk-super-secret-123"])
     assert "sk-super-secret-123" not in out and "***" in out
+
+
+def test_run_job_times_out_and_is_killed():
+    """A hung engine must not wedge a slot: run_job bounds it by JOB_TIMEOUT and kills the process tree."""
+    import sys
+    import time as _t
+    sup = _load_supervisor()
+    sup._req = lambda *a, **k: {}
+    sup.MOCK = False
+    sup.JOB_TIMEOUT = 1
+    sup.BOXCUTTER_CMD = [sys.executable, "-c", "import time; time.sleep(30)"]
+    t0 = _t.time()
+    out = sup.run_job({"id": 1, "argv": [], "target": "x"}, {})
+    assert _t.time() - t0 < 15                       # killed promptly, not after 30s
+    assert out["error"] and "timed out" in out["error"]
+
+
+def test_run_job_missing_engine_is_reported_not_crashed():
+    sup = _load_supervisor()
+    sup._req = lambda *a, **k: {}
+    sup.MOCK = False
+    sup.BOXCUTTER_CMD = ["definitely-not-a-real-binary-xyz-123"]
+    out = sup.run_job({"id": 1, "argv": [], "target": "x"}, {})
+    assert out["error"] and "not found" in out["error"]

@@ -1,15 +1,27 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { api } from '../api'
+import { api, isAdmin } from '../api'
 import { fmtDuration, timeAgo } from '../util'
 
 const route = useRoute()
 const id = route.params.id
 const r = ref(null)
+const admin = isAdmin()
+const conc = ref(null)          // the value in the stepper (initialised from the agent's reported slots)
 let timer = null
 
-async function load() { try { r.value = await api.get('/runners/' + id) } catch (e) { /* transient */ } }
+async function load() {
+  try {
+    r.value = await api.get('/runners/' + id)
+    if (conc.value === null) conc.value = r.value.slots
+  } catch (e) { /* transient */ }
+}
+function stepConc(d) { conc.value = Math.max(0, Math.min(32, (Number(conc.value) || 0) + d)) }
+async function applyConc() {
+  try { await api.patch('/runners/' + id, { concurrency: Math.max(0, Number(conc.value) || 0) }); await load() }
+  catch (e) { alert(e.message) }
+}
 function meterClass(v) { return v >= 85 ? 'hi' : (v >= 60 ? 'mid' : '') }
 onMounted(async () => { await load(); timer = setInterval(load, 2000) })
 onUnmounted(() => clearInterval(timer))
@@ -26,6 +38,24 @@ onUnmounted(() => clearInterval(timer))
     <div class="muted">{{ r.busy_slots }}/{{ r.slots }} slots busy · v{{ r.version || '?' }}
       <span v-if="r.ip"> · <code>{{ r.ip }}</code></span>
       <span v-if="r.host && r.host !== r.ip"> · {{ r.host }}</span> · last beat {{ timeAgo(r.last_heartbeat) }}</div>
+
+    <div v-if="admin" class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px">
+        <div>
+          <b>Boxcutters (concurrency)</b>
+          <div class="muted" style="font-size:12px">How many scans this agent runs in parallel — takes effect within ~10s.
+            <span v-if="r.desired_slots != null">Applying <b>{{ r.desired_slots }}</b>…</span>
+            <span v-else>Currently running <b>{{ r.slots }}</b>.</span>
+          </div>
+        </div>
+        <div class="row" style="gap:8px;align-items:center">
+          <button class="sm" @click="stepConc(-1)" :disabled="conc <= 0">−</button>
+          <input type="number" min="0" max="32" v-model.number="conc" style="width:72px;text-align:center" />
+          <button class="sm" @click="stepConc(1)" :disabled="conc >= 32">+</button>
+          <button class="primary sm" @click="applyConc">Apply</button>
+        </div>
+      </div>
+    </div>
 
     <div class="grid" style="margin-top:16px;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
       <div class="card">

@@ -20,6 +20,8 @@ from ..security import current_user, decode_user
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
+MAX_TARGETS = 100_000        # hard cap on targets per scan (protects the import path and response sizes)
+
 
 class ScanIn(BaseModel):
     name: str
@@ -44,23 +46,35 @@ def _require_write(session, scan, user):
 
 
 def _summary(session: Session, s: Scan) -> dict:
-    findings = session.exec(select(Finding).where(Finding.scan_id == s.id)).all()
+    # All counts are aggregate queries — never load the finding/job/target rows (a scan can have 100k+ of each).
     counts = {"new": 0, "open": 0, "resolved": 0}
-    for f in findings:
-        counts[f.state if f.state in counts else "open"] += 1
-    jobs = session.exec(select(Job).where(Job.scan_id == s.id, Job.run_no == s.run_no)).all()
-    jobs_done = sum(1 for j in jobs if j.status in ("done", "failed", "cancelled"))
-    running = [j for j in jobs if j.status in ("claimed", "running")]
-    running_targets = [t.value for t in (session.get(Target, j.target_id) for j in running[:6]) if t]
-    assets = len(session.exec(select(Target).where(Target.scan_id == s.id)).all())
+    total_f = 0
+    for state, c in session.exec(select(Finding.state, func.count()).where(
+            Finding.scan_id == s.id).group_by(Finding.state)).all():
+        total_f += c
+        counts[state if state in counts else "open"] += c
+    jstat = dict(session.exec(select(Job.status, func.count()).where(
+        Job.scan_id == s.id, Job.run_no == s.run_no).group_by(Job.status)).all())
+    jobs_total = sum(jstat.values())
+    jobs_done = jstat.get("done", 0) + jstat.get("failed", 0) + jstat.get("cancelled", 0)
+    running = jstat.get("running", 0) + jstat.get("claimed", 0)
+    running_targets: list[str] = []
+    if running:
+        for tid in session.exec(select(Job.target_id).where(
+                Job.scan_id == s.id, Job.run_no == s.run_no,
+                Job.status.in_(["claimed", "running"])).limit(6)).all():
+            t = session.get(Target, tid)
+            if t:
+                running_targets.append(t.value)
+    assets = session.exec(select(func.count()).select_from(Target).where(Target.scan_id == s.id)).one()
     return {"id": s.id, "name": s.name, "status": s.status, "run_no": s.run_no,
             "template_id": s.template_id, "owner_id": s.owner_id, "assets": assets,
             "findings_new": counts["new"], "findings_open_state": counts["open"],
             "findings_resolved": counts["resolved"],
             "findings_open": counts["new"] + counts["open"],   # "active" = new + open
-            "findings_total": len(findings),
-            "jobs_total": len(jobs), "jobs_done": jobs_done,
-            "running": len(running), "running_targets": running_targets,
+            "findings_total": total_f,
+            "jobs_total": jobs_total, "jobs_done": jobs_done,
+            "running": running, "running_targets": running_targets,
             "created_at": s.created_at, "last_run_at": s.last_run_at, "finished_at": s.finished_at}
 
 
@@ -74,8 +88,24 @@ def create_scan(body: ScanIn, user: User = Depends(current_user), session: Sessi
     session.add(scan)
     session.commit()
     session.refresh(scan)
-    for v in {t.strip() for t in body.targets if t.strip()}:
-        session.add(Target(scan_id=scan.id, value=v))
+    # de-dupe the import (case-insensitive, ignoring a trailing slash/dot), cap, and bulk-insert in chunks —
+    # importing 20k+ domains stays fast; keep each target's first-seen original spelling.
+    seen: set[str] = set()
+    values: list[str] = []
+    for t in body.targets:
+        v = t.strip()[:1024]
+        if not v:
+            continue
+        key = v.lower().rstrip("/.")
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(v)
+        if len(values) >= MAX_TARGETS:
+            break
+    tmaps = [{"scan_id": scan.id, "value": v} for v in values]
+    for i in range(0, len(tmaps), 1000):
+        session.bulk_insert_mappings(Target, tmaps[i:i + 1000])
     session.commit()
     n = enqueue_scan(session, scan)
     log_activity(session, "scan_created", f"Scan '{scan.name}' created — {n} assets", scan_id=scan.id)
@@ -100,10 +130,11 @@ def get_scan(scan_id: int, user: User = Depends(current_user), session: Session 
     scan = session.get(Scan, scan_id)
     if not scan or not _perm(session, scan, user):
         raise HTTPException(404, "not found")
-    targets = [t.value for t in session.exec(select(Target).where(Target.scan_id == scan_id)).all()]
-    jstat: dict = {}
-    for j in session.exec(select(Job).where(Job.scan_id == scan_id)).all():
-        jstat[j.status] = jstat.get(j.status, 0) + 1
+    # cap the returned target list (a scan can have tens of thousands; the UI lists assets via /jobs, paginated)
+    targets = list(session.exec(select(Target.value).where(
+        Target.scan_id == scan_id).limit(500)).all())
+    jstat = dict(session.exec(select(Job.status, func.count()).where(
+        Job.scan_id == scan_id).group_by(Job.status)).all())
     out = _summary(session, scan)
     try:
         vars_ = json.loads(scan.vars_json or "{}") or {}

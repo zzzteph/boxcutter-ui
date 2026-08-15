@@ -1,8 +1,9 @@
 name: build-images
 
-# Builds and pushes two images to GHCR so you can deploy them straight onto servers (no local build):
-#   ghcr.io/<owner>/boxcutter-server   the API + built SPA (single origin) — multi-arch: amd64 + arm64
-#   ghcr.io/<owner>/boxcutter-agent    the scanner (boxcutter image + supervisor) — amd64 only, see below
+# Builds and pushes images to GHCR so you can deploy them straight onto servers (no local build):
+#   ghcr.io/<owner>/boxcutter-server      the API + built SPA (single origin) — multi-arch: amd64 + arm64
+#   ghcr.io/<owner>/boxcutter-agent       the scanner (boxcutter image + supervisor) — amd64 only, see below
+#   ghcr.io/<owner>/boxcutter-standalone  server + one built-in agent in one container — amd64 only
 #
 # Runs on pushes to the default branch, on version tags (v1.2.3), and on demand. Each build produces a
 # multi-arch manifest, so `docker pull …:latest` picks the right architecture automatically.
@@ -29,7 +30,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Gate: the images are only built/pushed if the test suite is green.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install (api + dev deps)
+        working-directory: api
+        run: pip install -e ".[dev]"
+      - name: Run tests
+        working-directory: api
+        run: python -m pytest -q
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -40,6 +57,9 @@ jobs:
             platforms: linux/amd64,linux/arm64
           - name: boxcutter-agent    # `agent` target: base ghcr.io/zzzteph/boxcutter is amd64-only
             target: agent
+            platforms: linux/amd64
+          - name: boxcutter-standalone   # server + one built-in agent in one container (engine base = amd64)
+            target: standalone
             platforms: linux/amd64
     steps:
       - uses: actions/checkout@v4

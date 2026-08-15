@@ -15,6 +15,8 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import PlainTextResponse
 from sqlmodel import Session
 
+from .activity import prune_logs
+from .config import settings
 from .db import engine, init_db
 from .queue import requeue_stale
 from .routers import admin, auth, keys, runners, scans, templates
@@ -22,10 +24,14 @@ from .seed import seed
 
 
 async def _sweeper() -> None:
+    cycle = 0
     while True:
         try:
             with Session(engine) as s:
                 requeue_stale(s)
+                cycle += 1
+                if cycle % 20 == 0:      # ~ every 10 min: trim activity + job-event log rows past retention
+                    prune_logs(s, settings.activity_retention_days)
         except Exception:  # noqa: BLE001 - the sweeper must never die
             pass
         await asyncio.sleep(30)

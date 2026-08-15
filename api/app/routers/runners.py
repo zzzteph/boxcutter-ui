@@ -18,9 +18,9 @@ from ..activity import log_activity
 from ..config import settings
 from ..db import get_session
 from ..diff import is_issue, reconcile_run, upsert_finding
-from ..notify import notify
-from ..models import (Activity, EnrollToken, Finding, Job, JobEvent, LLMProfile, Runner, Scan, Target,
-                      Template, User)
+from ..notify import notify, notify_findings
+from ..models import (Activity, EnrollToken, Finding, Job, JobEvent, LLMProfile, NotifySettings, Runner, Scan,
+                      Target, Template, User)
 from ..queue import claim_job, maybe_finish_scan
 from ..security import (current_runner, current_user, hash_token, require_admin, user_from_api_key,
                         verify_password)
@@ -184,11 +184,16 @@ def job_result(job_id: int, body: ResultIn, runner: Runner = Depends(current_run
     target = session.get(Target, job.target_id)
     kind = tmpl.kind if tmpl else ""
     new_crits: list[str] = []
+    new_findings: list[dict] = []
     for f in (body.envelope or {}).get("data") or []:
         if isinstance(f, dict) and is_issue(f):        # skip recon/reachability noise (e.g. "host reachable")
             _, created = upsert_finding(session, job.scan_id, kind, target.value, f, run_no=job.run_no)
-            if created and str(f.get("severity", "")).title() == "Critical":
-                new_crits.append(str(f.get("title", ""))[:200])
+            if created:
+                sev = str(f.get("severity", "info")).title()
+                new_findings.append({"severity": sev, "title": str(f.get("title", ""))[:200],
+                                     "url": str(f.get("url", "")), "target": target.value})
+                if sev == "Critical":
+                    new_crits.append(str(f.get("title", ""))[:200])
     if body.error:                                # retry a failed job up to the cap, else mark it failed
         job.status = "pending" if job.attempts < settings.job_max_attempts else "failed"
         job.runner_id = None if job.status == "pending" else job.runner_id
@@ -216,6 +221,15 @@ def job_result(job_id: int, body: ResultIn, runner: Runner = Depends(current_run
         notify("new_critical",
                {"scan_id": scan.id, "scan": scan.name, "count": len(new_crits), "titles": new_crits},
                f"[boxcutter] {len(new_crits)} new critical finding(s) in '{scan.name}'")
+    if new_findings:                              # per-finding Telegram alerts (UI-configured, by severity)
+        ns = session.get(NotifySettings, 1)
+        if ns and ns.telegram_enabled and ns.telegram_token and ns.telegram_chat_id:
+            try:
+                sevs = set(json.loads(ns.severities_json or "[]"))
+            except Exception:  # noqa: BLE001
+                sevs = set()
+            notify_findings({"token": ns.telegram_token, "chat_id": ns.telegram_chat_id, "severities": sevs},
+                            new_findings)
     if maybe_finish_scan(session, job.scan_id):
         scan = session.get(Scan, job.scan_id)
         stats = reconcile_run(session, scan.id, scan.run_no, scan.last_run_at)
@@ -250,9 +264,12 @@ def heartbeat(body: HeartbeatIn, runner: Runner = Depends(current_runner),
     if body.ip:
         runner.ip = body.ip
     runner.last_heartbeat = datetime.now(timezone.utc)
+    # server-requested concurrency: once the agent reports it has applied the value, clear the one-shot command
+    if runner.desired_slots is not None and body.slots == runner.desired_slots:
+        runner.desired_slots = None
     session.add(runner)
     session.commit()
-    return {"ok": True}
+    return {"ok": True, "desired_slots": runner.desired_slots}
 
 
 # ---- fleet (users see it; admin manages enroll tokens) ------------------------------------------------------
@@ -263,7 +280,7 @@ def _runner_row(r: Runner) -> dict:
     connected = hb is not None and hb > (datetime.now(timezone.utc) - timedelta(seconds=45))
     return {"id": r.id, "name": r.name, "host": r.host, "ip": r.ip, "version": r.version,
             "status": r.status if connected else "disconnected", "connected": connected,
-            "slots": r.slots, "busy_slots": r.busy_slots,
+            "slots": r.slots, "desired_slots": r.desired_slots, "busy_slots": r.busy_slots,
             "current_jobs": json.loads(r.current_jobs_json or "[]"),
             "metrics": json.loads(r.metrics_json or "{}"),
             "last_heartbeat": r.last_heartbeat, "enrolled_at": r.enrolled_at}
@@ -302,16 +319,38 @@ def runner_detail(runner_id: int, user: User = Depends(current_user),
     return row
 
 
+class RunnerPatch(BaseModel):
+    concurrency: int
+
+
+@router.patch("/runners/{runner_id}")
+def set_runner_concurrency(runner_id: int, body: RunnerPatch, admin: User = Depends(require_admin),
+                           session: Session = Depends(get_session)):
+    """Ask an agent to run more/fewer boxcutters. The agent adopts the value on its next heartbeat (≤10s)."""
+    r = session.get(Runner, runner_id)
+    if not r:
+        raise HTTPException(404)
+    r.desired_slots = max(0, min(int(body.concurrency), 32))
+    session.add(r)
+    session.commit()
+    log_activity(session, "runner_concurrency",
+                 f"Requested '{r.name or ('runner #' + str(r.id))}' run {r.desired_slots} boxcutter(s)",
+                 runner_id=r.id)
+    return _runner_row(r)
+
+
 _SEV_RANK = ["Critical", "High", "Medium", "Low", "Info"]
 
 
 @router.get("/findings")
 def global_findings(severity: str | None = None, state: str | None = None, q: str | None = None,
-                    scan_id: int | None = None, sort: str = "severity", dir: str = "desc",
-                    limit: int = 50, offset: int = 0, user: User = Depends(current_user),
-                    session: Session = Depends(get_session)):
-    """Search findings across ALL scans (single shared group). Paginated; filter by severity/state/search/scan."""
-    limit, offset = max(1, min(limit, 200)), max(0, offset)
+                    scan_id: int | None = None, before: int | None = None, limit: int = 50,
+                    user: User = Depends(current_user), session: Session = Depends(get_session)):
+    """Findings across ALL scans as a most-recent-first feed with **keyset** pagination (`before` = the last id
+    you've seen), so it stays O(page) at any depth — no deep OFFSET over millions of rows. Filter by severity /
+    state / search / scan; for 'most severe first', pick a severity. Returns {items, next} (next = the cursor to
+    pass as `before` for the following page, or null at the end)."""
+    limit = max(1, min(limit, 200))
     conds = []
     if scan_id is not None:
         conds.append(Finding.scan_id == scan_id)
@@ -325,20 +364,17 @@ def global_findings(severity: str | None = None, state: str | None = None, q: st
         like = f"%{q}%"
         conds.append(or_(Finding.title.ilike(like), Finding.target.ilike(like),
                          Finding.url.ilike(like), Finding.cls.ilike(like)))
-    cnt = select(func.count()).select_from(Finding)
+    if before is not None:
+        conds.append(Finding.id < before)      # keyset: only rows older than the last one shown
     stmt = select(Finding, Scan.name).join(Scan, Scan.id == Finding.scan_id)
     if conds:
-        cnt, stmt = cnt.where(*conds), stmt.where(*conds)
-    total = session.exec(cnt).one()
-    sev_case = case(*[(Finding.severity == s, i) for i, s in enumerate(_SEV_RANK)], else_=5)
-    col = sev_case if sort == "severity" else getattr(
-        Finding, sort if sort in ("title", "target", "state", "last_seen") else "last_seen")
-    col = col.desc() if dir == "desc" else col.asc()
-    rows = session.exec(stmt.order_by(col, Finding.id.desc()).offset(offset).limit(limit)).all()
+        stmt = stmt.where(*conds)
+    rows = session.exec(stmt.order_by(Finding.id.desc()).limit(limit)).all()
     items = [{"id": f.id, "scan_id": f.scan_id, "scan": name, "severity": f.severity, "title": f.title,
               "target": f.target, "url": f.url, "cls": f.cls, "state": f.state, "last_seen": f.last_seen}
              for f, name in rows]
-    return {"items": items, "total": total, "limit": limit, "offset": offset}
+    nxt = items[-1]["id"] if len(items) == limit else None
+    return {"items": items, "next": nxt}
 
 
 @router.get("/stats")

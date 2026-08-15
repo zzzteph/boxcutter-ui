@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -34,6 +35,8 @@ VERSION = "0.1.0"
 # envelope. Lets `docker compose up` / a local supervisor demonstrate claim->event->result->diff offline
 # (and never scans a real target). See BUILD.md testing notes.
 MOCK = os.environ.get("MOCK_RUNNER", "").strip().lower() not in ("", "0", "false", "no")
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "3600") or 3600)   # hard-kill a boxcutter job after N seconds
+_POSIX = os.name == "posix"
 
 def _local_ip() -> str:
     """Best-effort primary IP of this host (the outbound-interface address)."""
@@ -175,8 +178,33 @@ def _mock_run(job: dict) -> dict:
     return {"envelope": envelope, "report": report, "error": None}
 
 
+def _kill_tree(proc) -> None:
+    """Terminate a job subprocess AND its children (boxcutter may spawn tools), escalating to SIGKILL."""
+    if proc is None:
+        return
+    try:
+        if _POSIX:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        try:
+            if _POSIX:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_job(job: dict, secrets: dict) -> dict:
-    """Run `boxcutter <argv>`, stream stderr lines back as events, capture stdout as the envelope/report."""
+    """Run `boxcutter <argv>`, stream stderr lines as events, capture stdout as the envelope/report. Bounded by
+    JOB_TIMEOUT and guaranteed to reap the whole process tree, so a hung / runaway / OOM'd engine can never
+    wedge a worker slot — the job just comes back as failed and the slot frees up."""
     if MOCK:
         return _mock_run(job)
     env = dict(os.environ)
@@ -184,19 +212,41 @@ def run_job(job: dict, secrets: dict) -> dict:
     # values to redact from any streamed line or captured output (never leak the LLM key back to the server)
     secret_vals = [str(v) for v in (secrets or {}).values() if v and len(str(v)) >= 6]
     cmd = BOXCUTTER_CMD + [str(a) for a in job["argv"]]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                            text=True, bufsize=1)
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                                text=True, bufsize=1,
+                                start_new_session=_POSIX)   # own process group -> we can kill the whole tree
 
-    def _pump_stderr():
-        for line in iter(proc.stderr.readline, ""):
-            line = line.rstrip("\n")
-            if line:
-                _emit(job["id"], _scrub(line, secret_vals))
+        def _pump_stderr():
+            try:
+                for line in iter(proc.stderr.readline, ""):
+                    line = line.rstrip("\n")
+                    if line:
+                        _emit(job["id"], _scrub(line, secret_vals))
+            except Exception:  # noqa: BLE001 - a broken pipe must not crash the job
+                pass
 
-    t = threading.Thread(target=_pump_stderr, daemon=True)
-    t.start()
-    stdout, _ = proc.communicate()
-    t.join(timeout=2)
+        t = threading.Thread(target=_pump_stderr, daemon=True)
+        t.start()
+        try:
+            stdout, _ = proc.communicate(timeout=JOB_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            t.join(timeout=2)
+            return {"envelope": {}, "report": None, "error": f"timed out after {JOB_TIMEOUT}s"}
+        t.join(timeout=2)
+    except FileNotFoundError:
+        return {"envelope": {}, "report": None, "error": f"engine not found: {cmd[0]} (set BOXCUTTER_CMD)"}
+    except Exception as e:  # noqa: BLE001 - any launch/IO failure -> reported as a failed job, slot survives
+        return {"envelope": {}, "report": None, "error": f"agent error: {e}"}
+    finally:
+        if proc is not None and proc.poll() is None:
+            _kill_tree(proc)
 
     envelope, report, error = {}, None, None
     text = (stdout or "").strip()
@@ -217,32 +267,43 @@ def run_job(job: dict, secrets: dict) -> dict:
 
 def worker(idx: int) -> None:
     while True:
-        if idx >= CFG.get("concurrency", 1) or not STATE.get("connected"):
-            time.sleep(1.0)
-            continue
         try:
-            res = _req("POST", "/runner/claim", {}, CFG["token"], timeout=65)
-        except Exception:  # noqa: BLE001
+            if idx >= CFG.get("concurrency", 1) or not STATE.get("connected"):
+                time.sleep(1.0)
+                continue
+            try:
+                res = _req("POST", "/runner/claim", {}, CFG["token"], timeout=65)
+            except Exception:  # noqa: BLE001
+                time.sleep(2.0)
+                continue
+            job = res.get("job")
+            if not job:
+                time.sleep(1.5)
+                continue
+            started = time.time()
+            with _LOCK:
+                STATE["slots"][idx] = {"job": job["id"], "target": job.get("target", ""), "started": started}
+            try:
+                out = run_job(job, res.get("secrets") or {})
+            except Exception as e:  # noqa: BLE001 - a crashed job must never kill the slot
+                out = {"envelope": {}, "report": None, "error": f"agent error: {e}"}
+            try:
+                _req("POST", f"/runner/jobs/{job['id']}/result", out, CFG["token"], timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+            with _LOCK:
+                STATE["recent"].insert(0, {"job": job["id"], "target": job.get("target", ""),
+                                           "status": "failed" if out.get("error") else "done",
+                                           "duration": round(time.time() - started, 1)})
+                STATE["recent"] = STATE["recent"][:12]
+                STATE["slots"][idx] = {"job": None, "target": ""}
+        except Exception:  # noqa: BLE001 - the slot must survive absolutely anything and keep claiming
+            try:
+                with _LOCK:
+                    STATE["slots"][idx] = {"job": None, "target": ""}
+            except Exception:  # noqa: BLE001
+                pass
             time.sleep(2.0)
-            continue
-        job = res.get("job")
-        if not job:
-            time.sleep(1.5)
-            continue
-        started = time.time()
-        with _LOCK:
-            STATE["slots"][idx] = {"job": job["id"], "target": job.get("target", ""), "started": started}
-        out = run_job(job, res.get("secrets") or {})
-        try:
-            _req("POST", f"/runner/jobs/{job['id']}/result", out, CFG["token"], timeout=30)
-        except Exception:  # noqa: BLE001
-            pass
-        with _LOCK:
-            STATE["recent"].insert(0, {"job": job["id"], "target": job.get("target", ""),
-                                       "status": "failed" if out.get("error") else "done",
-                                       "duration": round(time.time() - started, 1)})
-            STATE["recent"] = STATE["recent"][:12]
-            STATE["slots"][idx] = {"job": None, "target": ""}
 
 
 def _disc(msg: str) -> None:
@@ -312,35 +373,50 @@ def _metrics_windows() -> dict:
     return m
 
 
-def heartbeat_loop() -> None:
-    """Heartbeat + self-heal. On a 401 (e.g. the server restarted / lost our runner row) we re-enroll to get a
-    fresh token; on any success we (re)assert connected. This is what lets a runner survive a server bounce."""
-    while True:
-        m = _metrics()
+def _heartbeat_once() -> None:
+    m = _metrics()
+    with _LOCK:
+        STATE["metrics"] = m
+    if CFG.get("token"):
         with _LOCK:
-            STATE["metrics"] = m
-        if CFG.get("token"):
+            busy = [s["job"] for s in STATE["slots"].values() if s.get("job")]
+        try:
+            resp = _req("POST", "/runner/heartbeat",
+                        {"status": "busy" if busy else "idle", "slots": CFG.get("concurrency", 1),
+                         "busy_slots": len(busy), "current_jobs": busy, "version": VERSION,
+                         "ip": _IP, "metrics": m}, CFG["token"], timeout=15)
+            # the server (Scanners UI) can ask us to run more/fewer boxcutters — adopt it and persist
+            if isinstance(resp, dict) and resp.get("desired_slots") is not None:
+                ds = max(0, min(int(resp["desired_slots"]), MAX_SLOTS))
+                if ds != CFG.get("concurrency", 1):
+                    CFG["concurrency"] = ds
+                    with _LOCK:
+                        STATE["concurrency"] = ds
+                    save_config(CFG)
             with _LOCK:
-                busy = [s["job"] for s in STATE["slots"].values() if s.get("job")]
-            try:
-                _req("POST", "/runner/heartbeat",
-                     {"status": "busy" if busy else "idle", "slots": CFG.get("concurrency", 1),
-                      "busy_slots": len(busy), "current_jobs": busy, "version": VERSION,
-                      "ip": _IP, "metrics": m}, CFG["token"], timeout=15)
-                with _LOCK:
-                    STATE["connected"] = True
-                    STATE["error"] = ""
-            except urllib.error.HTTPError as e:
-                if e.code == 401:                    # token/runner gone (server redeploy) -> re-enroll
-                    CFG["token"] = ""
-                    _disc("re-enrolling")
-                    enroll()
-                else:
-                    _disc(f"heartbeat {e.code}")
-            except Exception as e:  # noqa: BLE001
-                _disc(f"heartbeat: {e}")
-        elif CFG.get("server_url") and (CFG.get("enroll_token") or CFG.get("api_key") or CFG.get("username")):
-            enroll()
+                STATE["connected"] = True
+                STATE["error"] = ""
+        except urllib.error.HTTPError as e:
+            if e.code == 401:                    # token/runner gone (server redeploy) -> re-enroll
+                CFG["token"] = ""
+                _disc("re-enrolling")
+                enroll()
+            else:
+                _disc(f"heartbeat {e.code}")
+        except Exception as e:  # noqa: BLE001
+            _disc(f"heartbeat: {e}")
+    elif CFG.get("server_url") and (CFG.get("enroll_token") or CFG.get("api_key") or CFG.get("username")):
+        enroll()
+
+
+def heartbeat_loop() -> None:
+    """Heartbeat + self-heal. On a 401 (server restart / lost runner row) we re-enroll for a fresh token; on
+    success we (re)assert connected. Wrapped so the thread survives anything (a bad metric read, DNS blip …)."""
+    while True:
+        try:
+            _heartbeat_once()
+        except Exception:  # noqa: BLE001 - the heartbeat thread must never die
+            pass
         time.sleep(10)
 
 
@@ -499,10 +575,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _spawn(target, args=()):
+    t = threading.Thread(target=target, args=args, daemon=True)
+    t.start()
+    return t
+
+
+def watchdog(registry: dict) -> None:
+    """Resurrect any worker/heartbeat thread that has died. The loops already catch everything, so this should
+    almost never fire — but it guarantees a dead thread can never leave a slot permanently gone."""
+    while True:
+        time.sleep(15)
+        try:
+            for key, spec in list(registry.items()):
+                if not spec["thread"].is_alive():
+                    spec["thread"] = _spawn(spec["target"], spec["args"])
+                    print(f"[watchdog] respawned {key}", flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> None:
+    registry: dict = {}
     for i in range(MAX_SLOTS):
-        threading.Thread(target=worker, args=(i,), daemon=True).start()
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
+        registry[f"worker-{i}"] = {"target": worker, "args": (i,), "thread": _spawn(worker, (i,))}
+    registry["heartbeat"] = {"target": heartbeat_loop, "args": (), "thread": _spawn(heartbeat_loop)}
+    _spawn(watchdog, (registry,))
     if CFG.get("server_url") and (CFG.get("enroll_token") or CFG.get("api_key") or CFG.get("username")):
         enroll()
     port = int(os.environ.get("RUNNER_UI_PORT", "7070"))

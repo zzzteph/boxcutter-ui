@@ -22,17 +22,25 @@ def dedup_key(scan_id: int, target_id: int, template_id: int, run_no: int) -> st
 
 
 def enqueue_scan(session: Session, scan: Scan) -> int:
-    """One job per target for the scan's current run_no. Unique by (scan, target, template, run_no)."""
-    n = 0
-    for t in session.exec(select(Target).where(Target.scan_id == scan.id)).all():
-        key = dedup_key(scan.id, t.id, scan.template_id, scan.run_no)
-        if session.exec(select(Job).where(Job.dedup_key == key)).first():
+    """One pending job per target for the scan's current run_no (unique by scan|target|template|run). Fetches
+    existing keys in ONE query and bulk-inserts in chunks — so enqueuing tens of thousands of targets is fast
+    and never wedges the request (no per-target SELECT, no ORM-object churn)."""
+    existing = set(session.exec(select(Job.dedup_key).where(
+        Job.scan_id == scan.id, Job.run_no == scan.run_no)).all())
+    tids = list(session.exec(select(Target.id).where(Target.scan_id == scan.id)).all())
+    created = datetime.now(timezone.utc)
+    rows = []
+    for tid in tids:
+        key = dedup_key(scan.id, tid, scan.template_id, scan.run_no)
+        if key in existing:
             continue
-        session.add(Job(scan_id=scan.id, target_id=t.id, template_id=scan.template_id,
-                        run_no=scan.run_no, dedup_key=key))
-        n += 1
+        rows.append({"scan_id": scan.id, "target_id": tid, "template_id": scan.template_id,
+                     "run_no": scan.run_no, "dedup_key": key, "status": "pending", "attempts": 0,
+                     "argv_json": "[]", "output": "", "created_at": created})
+    for i in range(0, len(rows), 1000):
+        session.bulk_insert_mappings(Job, rows[i:i + 1000])
     session.commit()
-    return n
+    return len(rows)
 
 
 def _next_pending_job_id(session: Session):

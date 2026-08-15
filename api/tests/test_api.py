@@ -504,8 +504,8 @@ def test_global_findings_search(client):
                                       "authorized": True}, headers=h).json()["id"]
     runner.run_one([{"severity": "critical", "title": "UNIQUEXYZ", "url": "http://x", "cls": "c"}])
     r = client.get("/findings?q=UNIQUEXYZ", headers=h).json()
-    assert r["total"] >= 1 and any(f["title"] == "UNIQUEXYZ" and f["scan_id"] == sid for f in r["items"])
-    assert "scan" in r["items"][0]                       # cross-scan: includes the scan name
+    assert any(f["title"] == "UNIQUEXYZ" and f["scan_id"] == sid for f in r["items"])
+    assert "scan" in r["items"][0] and "next" in r        # cross-scan feed: scan name + keyset cursor
 
 
 def test_activity_feed(client):
@@ -521,6 +521,124 @@ def test_activity_feed(client):
     assert {"scan_created", "job_claimed", "scan_done"} <= kinds and feed["total"] >= 3
     scoped = client.get(f"/activity?scan_id={sid}", headers=h).json()
     assert scoped["total"] >= 3 and all(a["scan_id"] == sid for a in scoped["items"])
+
+
+def test_runner_concurrency_control(client):
+    h = auth(login(client))
+    runner = FakeRunner(client, name="conc-runner")
+    # admin asks the agent to run 6 boxcutters
+    r = client.patch(f"/runners/{runner.id}", json={"concurrency": 6}, headers=h)
+    assert r.status_code == 200 and r.json()["desired_slots"] == 6
+    # heartbeat still reporting the old slots -> the command is delivered but not yet applied
+    hb = client.post("/runner/heartbeat", json={"status": "idle", "slots": 1, "busy_slots": 0,
+                                                "current_jobs": [], "version": "t"}, headers=runner.h).json()
+    assert hb["desired_slots"] == 6
+    # heartbeat reporting the adopted slots -> the one-shot command is cleared
+    hb2 = client.post("/runner/heartbeat", json={"status": "idle", "slots": 6, "busy_slots": 0,
+                                                 "current_jobs": [], "version": "t"}, headers=runner.h).json()
+    assert hb2["desired_slots"] is None
+    detail = client.get(f"/runners/{runner.id}", headers=h).json()
+    assert detail["slots"] == 6 and detail["desired_slots"] is None
+    # a non-admin can't command runners
+    client.post("/users", json={"username": "bob", "password": "pw", "role": "user"}, headers=h)
+    bh = auth(login(client, "bob", "pw"))
+    assert client.patch(f"/runners/{runner.id}", json={"concurrency": 2}, headers=bh).status_code in (401, 403)
+
+
+def test_import_dedupes_targets(client):
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="dedup-t")
+    sid = client.post("/scans", json={"name": "dedup", "template_id": tid, "targets": [
+        "Example.com", "example.com", "example.com/", "example.com.", "  b.example.com  ", "b.example.com"]},
+        headers=h).json()["id"]
+    client.post(f"/scans/{sid}/stop", headers=h)          # don't leave pending jobs in the shared queue
+    det = client.get(f"/scans/{sid}", headers=h).json()
+    assert det["assets"] == 2                              # all example.com variants collapse; + b.example.com
+
+
+def test_global_findings_keyset(client):
+    h = auth(login(client))
+    runner = FakeRunner(client, name="keyset-runner")
+    runner.drain(lambda t: [])                             # clear any pending jobs from earlier tests
+    tid = _tool_template(client, h, name="keyset-t")
+    client.post("/scans", json={"name": "keyset", "template_id": tid,
+                                "targets": [f"n{i}.example.com" for i in range(6)]}, headers=h)
+    runner.drain(lambda t: [{"severity": "low", "title": f"F-{t}", "url": f"http://{t}", "cls": "c"}])
+    seen, cur, pages = [], None, 0
+    while True:
+        u = "/findings?limit=2" + (f"&before={cur}" if cur is not None else "")
+        r = client.get(u, headers=h).json()
+        ids = [f["id"] for f in r["items"]]
+        assert ids == sorted(ids, reverse=True)            # most-recent (highest id) first within a page
+        if cur is not None:
+            assert all(i < cur for i in ids)               # keyset boundary: strictly older than the cursor
+        seen += ids
+        cur, pages = r["next"], pages + 1
+        if cur is None or pages > 60:
+            break
+    assert len(seen) == len(set(seen))                     # no duplicates across pages
+    assert len(seen) >= 6                                  # collected at least our 6 findings
+
+
+def test_prune_logs_by_age(client):
+    from datetime import datetime, timezone, timedelta
+    from sqlmodel import Session, select
+    from app.db import engine
+    from app.activity import prune_logs
+    from app.models import Activity
+    with Session(engine) as s:
+        s.add(Activity(kind="prune_old", message="old", at=datetime.now(timezone.utc) - timedelta(days=60)))
+        s.add(Activity(kind="prune_new", message="new"))
+        s.commit()
+        assert prune_logs(s, 30) >= 1
+        kinds = {a.kind for a in s.exec(select(Activity)).all()}
+        assert "prune_new" in kinds and "prune_old" not in kinds
+        assert prune_logs(s, 0) == 0                        # retention disabled -> no-op
+
+
+def test_login_rate_limited(client):
+    import app.routers.auth as auth_mod
+    auth_mod._login_fails.clear()
+    try:
+        for _ in range(auth_mod._LOGIN_MAX):               # burn the allowed failures
+            assert client.post("/auth/login", json={"username": "root", "password": "nope"}).status_code == 401
+        r = client.post("/auth/login", json={"username": "root", "password": "nope"})
+        assert r.status_code == 429 and "Retry-After" in r.headers      # now throttled
+        # even a correct password is blocked during the cooldown for this source
+        assert client.post("/auth/login", json={"username": "root", "password": "root"}).status_code == 429
+    finally:
+        auth_mod._login_fails.clear()                       # don't leak the block into other tests
+
+
+def test_telegram_notify_config(client):
+    h = auth(login(client))
+    r = client.get("/notify/telegram", headers=h).json()
+    assert r["enabled"] is False and r["has_token"] is False and "Critical" in r["severities"]
+    r = client.post("/notify/telegram", json={"enabled": True, "chat_id": "123", "token": "SECRET",
+                                              "severities": ["Critical", "High", "Medium", "bogus"]}, headers=h).json()
+    assert r["enabled"] and r["chat_id"] == "123" and r["has_token"] is True
+    assert set(r["severities"]) == {"Critical", "High", "Medium"}      # invalid severity dropped
+    assert "token" not in r and "telegram_token" not in r             # the secret is never returned
+    r = client.post("/notify/telegram", json={"chat_id": "456"}, headers=h).json()
+    assert r["chat_id"] == "456" and r["has_token"] is True            # token kept when omitted
+    client.post("/users", json={"username": "u2", "password": "pw", "role": "user"}, headers=h)
+    uh = auth(login(client, "u2", "pw"))
+    assert client.get("/notify/telegram", headers=uh).status_code in (401, 403)   # admin-only
+
+
+def test_notify_findings_filters_by_severity(monkeypatch):
+    import time as _t
+    import app.notify as nmod
+    sent = []
+    monkeypatch.setattr(nmod, "send_telegram", lambda token, chat, text: sent.append(text))
+    findings = [{"severity": "Critical", "title": "A", "url": "http://a"},
+                {"severity": "Low", "title": "B", "url": "http://b"},
+                {"severity": "High", "title": "C", "url": "http://c"}]
+    nmod.notify_findings({"token": "t", "chat_id": "c", "severities": {"Critical", "High"}}, findings)
+    _t.sleep(0.5)                                                      # the send runs in a daemon thread
+    blob = " ".join(sent)
+    assert "A" in blob and "C" in blob and "B" not in blob            # Low filtered out
+    assert "Critical" in blob and "http://a" in blob                  # severity + url in the message
 
 
 def test_llm_profile_patch_sets_key(client):

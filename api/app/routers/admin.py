@@ -2,12 +2,15 @@
 at job time, and never returned to any client."""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from ..db import get_session
-from ..models import LLMProfile, User
+from ..models import LLMProfile, NotifySettings, User
+from ..notify import telegram_test
 from ..security import current_user, hash_password, require_admin
 
 router = APIRouter(tags=["admin"])
@@ -123,3 +126,63 @@ def delete_llm(pid: int, admin: User = Depends(require_admin), session: Session 
         session.delete(p)
         session.commit()
     return {"ok": True}
+
+
+# ---- Telegram notifications (admin). Bot token is write-only, never returned to the browser. ----------------
+_NOTIFY_SEVS = ["Critical", "High", "Medium", "Low", "Info"]
+
+
+class TelegramIn(BaseModel):
+    enabled: bool | None = None
+    chat_id: str | None = None
+    token: str | None = None                 # write-only; only stored when a non-empty value is supplied
+    severities: list[str] | None = None
+
+
+def _notify_out(ns: NotifySettings) -> dict:
+    try:
+        sevs = json.loads(ns.severities_json or "[]")
+    except Exception:  # noqa: BLE001
+        sevs = []
+    return {"enabled": ns.telegram_enabled, "chat_id": ns.telegram_chat_id,
+            "has_token": bool(ns.telegram_token), "severities": sevs}
+
+
+def _get_notify(session: Session) -> NotifySettings:
+    ns = session.get(NotifySettings, 1)
+    if not ns:
+        ns = NotifySettings(id=1)
+        session.add(ns)
+        session.commit()
+    return ns
+
+
+@router.get("/notify/telegram")
+def get_telegram(admin: User = Depends(require_admin), session: Session = Depends(get_session)):
+    return _notify_out(_get_notify(session))
+
+
+@router.post("/notify/telegram")
+def set_telegram(body: TelegramIn, admin: User = Depends(require_admin),
+                 session: Session = Depends(get_session)):
+    ns = _get_notify(session)
+    if body.enabled is not None:
+        ns.telegram_enabled = body.enabled
+    if body.chat_id is not None:
+        ns.telegram_chat_id = body.chat_id[:64]
+    if body.token:                           # only overwrite the token when a new one is supplied
+        ns.telegram_token = body.token
+    if body.severities is not None:
+        ns.severities_json = json.dumps([s for s in body.severities if s in _NOTIFY_SEVS])
+    session.add(ns)
+    session.commit()
+    return _notify_out(ns)
+
+
+@router.post("/notify/telegram/test")
+def test_telegram(admin: User = Depends(require_admin), session: Session = Depends(get_session)):
+    ns = _get_notify(session)
+    if not (ns.telegram_token and ns.telegram_chat_id):
+        raise HTTPException(400, "set a bot token and chat id first")
+    ok, err = telegram_test(ns.telegram_token, ns.telegram_chat_id)
+    return {"ok": ok, "error": err}

@@ -10,7 +10,7 @@ from sqlmodel import Session, select
 
 from .config import settings
 from .db import engine
-from .models import EnrollToken, LLMProfile, Template, User
+from .models import EnrollToken, LLMProfile, NotifySettings, Template, User
 from .security import hash_password, hash_token
 
 # Starter templates. Workflows/tools are the stock boxcutter names; extend these lists to add more.
@@ -59,4 +59,13 @@ def seed() -> None:
         for a in AGENTS:
             _ensure_template(s, a, "ai_agent", a, admin.id, llm_profile_id=profile.id,
                              context="Authorized assessment. Report only real, exploitable issues.")
+
+        # Telegram notification settings singleton — seed from env if a bot token/chat id were provided
+        if not s.exec(select(NotifySettings)).first():
+            ns = NotifySettings(id=1)
+            if settings.telegram_bot_token and settings.telegram_chat_id:
+                ns.telegram_enabled = True
+                ns.telegram_token = settings.telegram_bot_token
+                ns.telegram_chat_id = settings.telegram_chat_id
+            s.add(ns)
         s.commit()

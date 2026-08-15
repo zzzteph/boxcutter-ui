@@ -47,3 +47,29 @@ FROM apibase AS server
 COPY --from=web /web/dist ./web_dist
 # SQLite DB + the auto-generated JWT secret live here; mount a named volume to persist across restarts.
 VOLUME ["/app/data"]
+
+# ---- target: boxcutter-standalone (server + ONE built-in agent, all in one container) ----
+# FROM the engine image so `boxcutter` is on PATH; we add the server deps/code, the built SPA, the supervisor,
+# and a launcher that runs uvicorn + one auto-enrolled agent together.
+#   docker run -d -p 8000:8000 -v boxcutter-data:/app/data boxcutter-standalone
+# NOTE: the server needs Python >= 3.10 (3.10+ typing). This assumes the boxcutter base ships a modern python;
+# if it doesn't, use the two separate images instead. amd64 only (the engine base is amd64).
+FROM ghcr.io/zzzteph/boxcutter:latest AS standalone
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app BOXCUTTER_CMD=boxcutter CONCURRENCY=4 RUNNER_UI_PORT=7070
+# The engine's base marks the system python "externally managed" (PEP 668), so install the server deps into
+# their own venv. The launcher runs uvicorn + the supervisor from this venv; the `boxcutter` engine keeps using
+# its own on-PATH install.
+RUN python3 -m venv /opt/srv \
+ && /opt/srv/bin/pip install --no-cache-dir \
+    "fastapi>=0.110" "uvicorn[standard]>=0.27" "sqlmodel>=0.0.16" \
+    "pydantic-settings>=2.2" "passlib[bcrypt]>=1.7" "bcrypt>=4.0.1,<4.1" "pyjwt>=2.8" \
+    "python-multipart>=0.0.9" "pymysql>=1.1" "requests>=2.31"
+COPY api/app ./app
+COPY runner/supervisor.py /supervisor.py
+COPY deploy/standalone.py /standalone.py
+COPY --from=web /web/dist ./web_dist
+# holds the SQLite DB + the auto-generated JWT secret; mount a named volume to persist across restarts
+VOLUME ["/app/data"]
+EXPOSE 8000 7070
+ENTRYPOINT ["/opt/srv/bin/python", "/standalone.py"]

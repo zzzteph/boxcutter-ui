@@ -20,6 +20,7 @@ engine = create_engine(settings.database_url, echo=False, pool_pre_ping=True, co
 _ADDED_COLUMNS = [
     ("scan", "vars_json", "TEXT", "'{}'"),
     ("runner", "ip", "VARCHAR(64)", "''"),
+    ("runner", "desired_slots", "INTEGER", "NULL"),
 ]
 
 
@@ -47,6 +48,40 @@ def _ensure_columns() -> None:
                 pass
 
 
+# Indexes that speed the hot paths at scale (fresh DBs get them from the models; this adds them to a DB that
+# predates the column/index). Best-effort CREATE INDEX — skipped if already present. (name, table, columns).
+_ADDED_INDEXES = [
+    ("ix_job_status", "job", "(status)"),
+    ("ix_job_scan_status_created", "job", "(scan_id, status, created_at)"),
+    ("ix_scan_status", "scan", "(status)"),
+    ("ix_finding_scan_fp", "finding", "(scan_id, fingerprint)"),
+    ("ix_finding_scan_sev", "finding", "(scan_id, severity)"),
+    ("ix_jobevent_at", "jobevent", "(at)"),
+]
+
+
+def _ensure_indexes() -> None:
+    from sqlalchemy import inspect
+    insp = inspect(engine)
+    try:
+        tables = set(insp.get_table_names())
+    except Exception:
+        return
+    with engine.begin() as conn:
+        for name, table, cols in _ADDED_INDEXES:
+            if table not in tables:
+                continue
+            try:
+                if name in {ix.get("name") for ix in insp.get_indexes(table)}:
+                    continue
+            except Exception:
+                pass
+            try:
+                conn.exec_driver_sql(f"CREATE INDEX {name} ON {table} {cols}")
+            except Exception:
+                pass
+
+
 def init_db() -> None:
     # secure-by-default: if SECRET_KEY wasn't provided, use a random secret persisted to the data dir
     if settings.secret_key == DEV_SECRET:
@@ -57,6 +92,7 @@ def init_db() -> None:
     from . import models  # noqa: F401
     SQLModel.metadata.create_all(engine)
     _ensure_columns()
+    _ensure_indexes()
     if _is_sqlite:
         with engine.connect() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL")

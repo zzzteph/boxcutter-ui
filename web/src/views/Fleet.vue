@@ -1,15 +1,21 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { api } from '../api'
+import { api, isAdmin } from '../api'
 import { timeAgo } from '../util'
 
 const router = useRouter()
 const runners = ref([])
 const newToken = ref('')
+const admin = isAdmin()
 let timer = null
 
 async function load() { try { runners.value = await api.get('/runners') } catch (e) { /* transient */ } }
+async function bump(r, d) {
+  const cur = (r.desired_slots != null ? r.desired_slots : r.slots)
+  try { await api.patch('/runners/' + r.id, { concurrency: Math.max(0, Math.min(32, cur + d)) }); await load() }
+  catch (e) { alert(e.message) }
+}
 async function mkToken() {
   try { const r = await api.post('/enroll-tokens', { label: 'ui' }); newToken.value = r.token }
   catch (e) { alert(e.message) }
@@ -39,7 +45,16 @@ onUnmounted(() => clearInterval(timer))
         <td data-label="Scanner"><b>{{ r.name || ('runner #' + r.id) }}</b></td>
         <td data-label="IP"><code>{{ r.ip || '—' }}</code></td>
         <td data-label="Status">{{ r.status }}</td>
-        <td data-label="Slots">{{ r.busy_slots }}/{{ r.slots }}</td>
+        <td data-label="Slots">
+          <div class="row" style="gap:6px;align-items:center;flex-wrap:nowrap">
+            <span>{{ r.busy_slots }}/{{ r.slots }}</span>
+            <span v-if="r.desired_slots != null" class="muted" title="requested">→ {{ r.desired_slots }}</span>
+            <template v-if="admin">
+              <button class="sm ghost" style="padding:0 10px" title="run fewer" @click.stop="bump(r, -1)">−</button>
+              <button class="sm ghost" style="padding:0 10px" title="run more" @click.stop="bump(r, 1)">+</button>
+            </template>
+          </div>
+        </td>
         <td data-label="CPU">
           <template v-if="r.metrics && r.metrics.cpu != null">
             <div class="meter" style="min-width:70px"><div :class="meterClass(r.metrics.cpu)" :style="{ width: r.metrics.cpu + '%' }"></div></div>

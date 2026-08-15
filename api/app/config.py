@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     boxcutter_image: str = "ghcr.io/zzzteph/boxcutter:latest"
     job_visibility_timeout: int = 180        # seconds without a heartbeat before a claimed job is requeued
     job_max_attempts: int = 3                # a job is retried up to this many times before it's marked failed
+    activity_retention_days: int = 30        # prune activity + job-event log rows older than this (0 = keep all)
     enroll_token: str = ""                   # empty = none seeded; create one in the UI (Scanners → enroll token)
 
     # optional notifications (scan-done, new-critical); all empty = disabled
