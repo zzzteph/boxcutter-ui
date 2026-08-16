@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, watch, onMounted } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted } from 'vue'
 import { api, isAdmin } from '../api'
 import Select from '../components/Select.vue'
 
@@ -86,7 +86,9 @@ const templates = ref([])
 const profiles = ref([])
 const err = ref('')
 const loading = ref(true)
-const form = reactive({ name: '', kind: 'tool', specName: 'httpx', customName: '', params: [], context: '', llm_profile_id: null })
+const editingId = ref(null)                            // null = creating; an id = editing that template
+const form = reactive({ name: '', kind: 'tool', specName: 'httpx', customName: '', params: [], context: '', llm_profile_id: null, description: '' })
+const isEditing = computed(() => editingId.value != null)
 
 function addParam() { form.params.push({ flag: '', value: '' }) }
 function rmParam(i) { form.params.splice(i, 1) }
@@ -115,8 +117,9 @@ const preview = computed(() => {
 })
 
 // when the kind changes, default the picker to that kind's first known item, and suggest a name
-watch(() => form.kind, (k) => { form.specName = (CATALOG[k][0] || {}).name || CUSTOM })
-watch(resolvedSpec, (s) => { if (s && !form.name.trim()) form.name = s })
+const suspendWatch = ref(false)                        // silence the auto-defaults while loading a template to edit
+watch(() => form.kind, (k) => { if (!suspendWatch.value) form.specName = (CATALOG[k][0] || {}).name || CUSTOM })
+watch(resolvedSpec, (s) => { if (!suspendWatch.value && s && !form.name.trim()) form.name = s })
 
 async function load() {
   try {
@@ -124,7 +127,34 @@ async function load() {
     profiles.value = await api.get('/llm-profiles')
   } catch (e) { err.value = e.message } finally { loading.value = false }
 }
-async function create() {
+function resetForm() {
+  editingId.value = null
+  form.name = ''; form.customName = ''; form.params = []; form.context = ''; form.llm_profile_id = null
+  form.description = ''; form.kind = 'tool'; form.specName = (CATALOG.tool[0] || {}).name || CUSTOM
+}
+function cancelEdit() { resetForm(); err.value = '' }
+
+// load an existing template into the form so it can be edited (the form doubles as the editor)
+async function startEdit(t) {
+  err.value = ''
+  suspendWatch.value = true
+  editingId.value = t.id
+  form.kind = t.kind
+  const known = (CATALOG[t.kind] || []).some(o => o.name === t.spec?.name)
+  form.specName = known ? t.spec.name : CUSTOM
+  form.customName = known ? '' : (t.spec?.name || '')
+  form.name = t.name
+  form.description = t.description || ''
+  form.context = t.context || ''
+  form.llm_profile_id = t.llm_profile_id || null
+  form.params = (t.spec?.params || []).map(p => ({ flag: p.flag, value: p.value }))
+  for (const f of (t.spec?.flags || [])) form.params.push({ flag: String(f), value: '' })
+  await nextTick()
+  suspendWatch.value = false
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+async function save() {
   err.value = ''
   try {
     const params = form.params.filter(p => p.flag.trim())
@@ -132,25 +162,30 @@ async function create() {
     const body = {
       name: form.name.trim(), kind: form.kind,
       spec: { name: resolvedSpec.value, params, flags: [] },
+      description: (form.description.trim() || selectedDesc.value || ''),
+      context: form.kind === 'ai_agent' ? (form.context || null) : null,
+      llm_profile_id: form.kind === 'ai_agent' ? form.llm_profile_id : null,
     }
-    if (form.kind === 'ai_agent') { body.context = form.context || null; body.llm_profile_id = form.llm_profile_id }
-    await api.post('/templates', body)
-    form.name = ''; form.customName = ''; form.params = []; form.context = ''; form.llm_profile_id = null
-    form.specName = (CATALOG[form.kind][0] || {}).name || CUSTOM
+    if (isEditing.value) await api.patch('/templates/' + editingId.value, body)
+    else await api.post('/templates', body)
+    resetForm()
     await load()
   } catch (e) { err.value = e.message }
 }
 async function del(id) {
   if (!confirm('Delete this template?')) return
-  try { await api.del('/templates/' + id); await load() } catch (e) { alert(e.message) }
+  try { await api.del('/templates/' + id); if (editingId.value === id) resetForm(); await load() } catch (e) { alert(e.message) }
 }
 onMounted(load)
 </script>
 
 <template>
   <h1>Templates</h1>
-  <div class="card" style="margin-bottom:18px">
-    <h2>New template</h2>
+  <div class="card" style="margin-bottom:18px" :class="{ editing: isEditing }">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0">{{ isEditing ? 'Edit template' : 'New template' }}</h2>
+      <button v-if="isEditing" class="ghost sm" @click="cancelEdit">Cancel</button>
+    </div>
     <div class="row" style="gap:14px;align-items:flex-start">
       <div style="flex:1;min-width:140px">
         <label>Kind</label>
@@ -178,6 +213,9 @@ onMounted(load)
     <button class="tonal sm" @click="addParam">+ Add parameter</button>
     <pre class="cmd" style="margin-top:10px">{{ preview }}</pre>
 
+    <label style="margin-top:14px">Description <span class="muted">— shown in the scan template picker</span></label>
+    <textarea v-model="form.description" rows="2" :placeholder="selectedDesc || 'What this template does'"></textarea>
+
     <template v-if="form.kind === 'ai_agent'">
       <label>Default context (guidance for the agent — scans can override per run)</label>
       <textarea v-model="form.context" rows="2" placeholder="Focus on auth and access control"></textarea>
@@ -190,24 +228,33 @@ onMounted(load)
       </p>
     </template>
     <p v-if="err" style="color:var(--bad)">{{ err }}</p>
-    <button class="primary" style="margin-top:12px" :disabled="!canCreate" @click="create">Create template</button>
+    <div class="row" style="margin-top:12px;gap:10px">
+      <button class="primary" :disabled="!canCreate" @click="save">{{ isEditing ? 'Save changes' : 'Create template' }}</button>
+      <button v-if="isEditing" class="ghost" @click="cancelEdit">Cancel</button>
+    </div>
   </div>
 
   <div class="grid">
-    <div v-for="t in templates" :key="t.id" class="card">
+    <div v-for="t in templates" :key="t.id" class="card" :class="{ 'is-editing': t.id === editingId }">
       <div class="row" style="justify-content:space-between;align-items:flex-start">
         <b>{{ t.name }}</b><span class="tag" :class="'kind-' + t.kind">{{ KIND_LABEL[t.kind] || t.kind }}</span>
       </div>
       <div class="muted" style="margin-top:8px"><code>{{ t.spec.name }}</code></div>
+      <div v-if="t.description" class="muted" style="font-size:12.5px;margin-top:6px;line-height:1.4">{{ t.description }}</div>
       <pre v-if="specTokens(t.spec).length" class="cmd sm">{{ specTokens(t.spec).join(' ') }}</pre>
       <div v-if="t.kind === 'ai_agent'" class="muted" style="font-size:12px;margin-top:4px">
         profile: {{ profileName(t.llm_profile_id) }}<span v-if="t.context"> · “{{ t.context }}”</span>
       </div>
       <div class="row" style="margin-top:10px;gap:8px">
-        <button class="danger ghost" @click="del(t.id)">Delete</button>
+        <button class="tonal sm" @click="startEdit(t)">Edit</button>
+        <button class="danger ghost sm" @click="del(t.id)">Delete</button>
       </div>
     </div>
     <div v-if="loading" class="muted">Loading…</div>
     <div v-else-if="!templates.length" class="muted">No templates yet. Create one above.</div>
   </div>
 </template>
+
+<style scoped>
+.card.editing, .card.is-editing { box-shadow: inset 0 0 0 1px var(--accent); }
+</style>

@@ -272,6 +272,84 @@ def test_preseed_templates_and_demo_profile(client):
     assert any(t["kind"] == "tool" and t["spec"]["name"] == "httpx" for t in tmpls)
     assert any(t["kind"] == "ai_agent" and t["spec"]["name"] == "irvin" for t in tmpls)
     assert any(p["name"].startswith("demo") for p in client.get("/llm-profiles", headers=h).json())
+    # every seeded template carries the stock engine's own description, so the picker is self-explanatory
+    # (seeded templates are named after the tool/workflow/agent; other tests add extra httpx-spec templates)
+    seeded = {t["name"]: t for t in tmpls}
+    assert "httpx" in seeded["httpx"]["description"].lower() and len(seeded["httpx"]["description"]) > 10
+    assert seeded["web-full"]["description"].strip() and seeded["irvin"]["description"].strip()
+
+
+def test_edit_template(client):
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="editable")
+    # rename, add a boxcutter parameter, and set a description via PATCH
+    r = client.patch(f"/templates/{tid}", json={
+        "name": "renamed", "description": "custom desc",
+        "spec": {"name": "httpx", "params": [{"flag": "--rate", "value": "50"}]}}, headers=h)
+    assert r.status_code == 200, r.text
+    got = client.get(f"/templates/{tid}", headers=h).json()
+    assert got["name"] == "renamed" and got["description"] == "custom desc"
+    assert got["spec"]["params"] == [{"flag": "--rate", "value": "50"}]
+    # the edited parameter flows into the next scan's argv
+    sid = client.post("/scans", json={"name": "edited", "template_id": tid,
+                                      "targets": ["example.com"], "authorized": True}, headers=h).json()["id"]
+    claimed = FakeRunner(client, name="edit-runner").claim()["job"]
+    assert claimed["argv"] == ["httpx", "example.com", "--rate", "50"]
+    # a bad kind is rejected
+    assert client.patch(f"/templates/{tid}", json={"kind": "nope"}, headers=h).status_code == 400
+
+
+def test_stop_cancels_inflight_and_heartbeat_tells_agent(client):
+    """Stopping a scan cancels its in-flight (claimed) job, the heartbeat then tells the holding agent to stop
+    it, and the agent's late result for it is ignored (no finding leaks in)."""
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="stopme")
+    sid = client.post("/scans", json={"name": "stopme", "template_id": tid,
+                                      "targets": ["a.example.com", "b.example.com"], "authorized": True},
+                      headers=h).json()["id"]
+    r = FakeRunner(client, name="stop-runner")
+    job = r.claim()["job"]
+    assert job and job["token"]
+    assert client.post(f"/scans/{sid}/stop", headers=h).status_code == 200
+    hb = r.heartbeat(busy=[job["id"]]).json()
+    assert job["id"] in hb["cancel"]                 # server tells the agent to stop the job it's holding
+    # a late result for the cancelled job is dropped — no "late" finding appears
+    r.result(job["id"], data=[{"severity": "high", "cls": "x", "title": "late", "url": "http://a.example.com"}])
+    findings = client.get(f"/scans/{sid}/findings", headers=h).json()["items"]
+    assert not any(f["title"] == "late" for f in findings)
+
+
+def test_deleted_scan_job_is_cancelled_and_stale_post_rejected(client):
+    """After a scan is deleted its job rows are gone, so the heartbeat tells the agent to stop them and any
+    late event/result for that (now free) id is rejected instead of landing on a reused id."""
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="delme")
+    sid = client.post("/scans", json={"name": "delme", "template_id": tid,
+                                      "targets": ["c.example.com"], "authorized": True}, headers=h).json()["id"]
+    r = FakeRunner(client, name="del-runner")
+    job = r.claim()["job"]
+    assert client.delete(f"/scans/{sid}", headers=h).status_code == 200
+    hb = r.heartbeat(busy=[job["id"]]).json()
+    assert job["id"] in hb["cancel"]                 # job row gone -> cancel
+    assert r.emit(job["id"], "late line").status_code == 404
+
+
+def test_result_token_guard_rejects_reused_id(client):
+    """The run token is what makes id reuse safe: a post carrying a different token than the current job (as a
+    stale agent finishing a deleted job whose integer id was reused) is rejected; the right token is accepted."""
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="tok")
+    sid = client.post("/scans", json={"name": "tok", "template_id": tid,
+                                      "targets": ["d.example.com"], "authorized": True}, headers=h).json()["id"]
+    r = FakeRunner(client, name="tok-runner")
+    job = r.claim()["job"]
+    assert job["token"] and len(job["token"]) == 32
+    bad = client.post(f"/runner/jobs/{job['id']}/result",
+                      json={"envelope": {"data": []}, "token": "deadbeef" * 4}, headers=r.h)
+    assert bad.status_code == 404
+    ok = client.post(f"/runner/jobs/{job['id']}/result",
+                     json={"envelope": {"data": []}, "token": job["token"]}, headers=r.h)
+    assert ok.status_code == 200
 
 
 def test_reachable_recon_is_not_a_finding(client):
@@ -654,6 +732,25 @@ def test_delete_scan(client):
     assert client.delete(f"/scans/{sid}", headers=h).json()["ok"] is True
     assert client.get(f"/scans/{sid}", headers=h).status_code == 404          # scan gone
     assert client.get(f"/scans/{sid}/findings", headers=h).status_code == 404  # and its findings
+
+
+def test_delete_scan_batches_drain_fully(client):
+    """The batched delete must remove EVERY row even when there is more than one batch's worth (the loop must
+    not stop after the first batch) — this is what keeps a 100k-row delete from wedging the write lock."""
+    from sqlmodel import Session, select
+    from app.db import engine
+    from app.models import Target
+    from app.routers.scans import _delete_scan_rows
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="batch-del")
+    sid = client.post("/scans", json={"name": "batchy", "template_id": tid,
+                                      "targets": [f"h{i}.example.com" for i in range(5)],
+                                      "authorized": True}, headers=h).json()["id"]
+    with Session(engine) as s:
+        assert len(s.exec(select(Target.id).where(Target.scan_id == sid)).all()) == 5
+        _delete_scan_rows(s, Target, sid, batch=2)              # 5 rows, batch of 2 -> must loop 3x, not stop at 2
+        assert s.exec(select(Target.id).where(Target.scan_id == sid)).first() is None
+    client.delete(f"/scans/{sid}", headers=h)                  # clean up the (now child-less) scan row
 
 
 def test_2fa_totp_flow(client):

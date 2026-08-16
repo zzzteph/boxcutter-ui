@@ -23,6 +23,8 @@ _ADDED_COLUMNS = [
     ("runner", "desired_slots", "INTEGER", "NULL"),
     ("user", "totp_secret", "TEXT", "NULL"),
     ("user", "totp_enabled", "BOOLEAN", "0"),
+    ("template", "description", "TEXT", "''"),
+    ("job", "token", "VARCHAR(32)", "''"),
 ]
 
 

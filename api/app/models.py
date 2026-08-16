@@ -58,6 +58,7 @@ class Template(SQLModel, table=True):
     name: str = Field(max_length=200)
     kind: str = Field(max_length=32)                          # workflow | tool | ai_agent
     spec_json: str = _text("{}")                             # {"name": "...", "flags": [...]}
+    description: str = _text("")                             # official boxcutter description, shown in the picker
     context: Optional[str] = Field(default=None, sa_column=Column(Text))
     llm_profile_id: Optional[int] = Field(default=None, foreign_key="llmprofile.id")
     owner_id: int = Field(foreign_key="user.id")
@@ -107,6 +108,10 @@ class Job(SQLModel, table=True):
     template_id: int = Field(foreign_key="template.id")
     run_no: int = 0
     dedup_key: str = Field(index=True, unique=True, max_length=128)
+    # opaque per-job run token: integer PKs get reused after a scan is deleted (SQLite reuses rowids), so a
+    # stale agent finishing a deleted job could post its result to a REUSED id now owned by a new scan. The
+    # agent echoes this token; result/event posts whose token doesn't match the current job are rejected.
+    token: str = Field(default="", max_length=32)
     status: str = Field(default="pending", index=True, max_length=24)  # pending|claimed|running|done|failed|cancelled
     runner_id: Optional[int] = Field(default=None, foreign_key="runner.id")
     attempts: int = 0

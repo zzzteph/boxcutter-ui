@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
-import Select from '../components/Select.vue'
+import TemplatePicker from '../components/TemplatePicker.vue'
 
 const router = useRouter()
 const templates = ref([])
@@ -18,7 +18,6 @@ function addCustom() { vars.custom.push({ key: '', value: '' }) }
 function rmCustom(i) { vars.custom.splice(i, 1) }
 
 const targetCount = computed(() => targets.value.split(/\s+/).filter(Boolean).length)
-const tmplOpts = computed(() => templates.value.map(t => ({ value: t.id, label: `${t.name} (${t.kind})` })))
 const selTmpl = computed(() => templates.value.find(t => t.id === templateId.value) || null)
 const isAgent = computed(() => selTmpl.value?.kind === 'ai_agent')
 
@@ -97,7 +96,9 @@ onMounted(load)
         </div>
         <div>
           <label>Template</label>
-          <Select v-model="templateId" :options="tmplOpts" placeholder="Select a template…" />
+          <TemplatePicker v-model="templateId" :templates="templates" />
+          <div v-if="selTmpl?.description" class="muted" style="font-size:12.5px;margin-top:6px;line-height:1.4">
+            {{ selTmpl.description }}</div>
         </div>
       </div>
 

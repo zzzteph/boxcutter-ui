@@ -149,8 +149,17 @@ def claim(runner: Runner = Depends(current_runner), session: Session = Depends(g
     session.commit()
     log_activity(session, "job_claimed", f"'{runner.name}' took {target.value}",
                  scan_id=job.scan_id, runner_id=runner.id)
-    return {"job": {"id": job.id, "scan_id": job.scan_id, "target": target.value, "argv": argv},
+    return {"job": {"id": job.id, "scan_id": job.scan_id, "target": target.value, "argv": argv,
+                    "token": job.token},
             "secrets": secrets_env}
+
+
+def _stale(job: Job | None, runner: Runner, token: str) -> bool:
+    """True if this post should be dropped: the job is gone, belongs to another runner, or its run token no
+    longer matches (the integer id was reused by a newer scan after the original was deleted)."""
+    if not job or job.runner_id != runner.id:
+        return True
+    return bool(job.token and token and token != job.token)
 
 
 class EventIn(BaseModel):
@@ -158,13 +167,14 @@ class EventIn(BaseModel):
     agent: str = ""
     line: str = ""
     reasoning: str | None = None
+    token: str = ""
 
 
 @router.post("/runner/jobs/{job_id}/event")
 def job_event(job_id: int, body: EventIn, runner: Runner = Depends(current_runner),
               session: Session = Depends(get_session)):
     job = session.get(Job, job_id)
-    if not job or job.runner_id != runner.id:
+    if _stale(job, runner, body.token):
         raise HTTPException(404)
     if job.status == "claimed":
         job.status = "running"
@@ -179,14 +189,17 @@ class ResultIn(BaseModel):
     envelope: dict = {}
     report: str | None = None
     error: str | None = None
+    token: str = ""
 
 
 @router.post("/runner/jobs/{job_id}/result")
 def job_result(job_id: int, body: ResultIn, runner: Runner = Depends(current_runner),
                session: Session = Depends(get_session)):
     job = session.get(Job, job_id)
-    if not job or job.runner_id != runner.id:
+    if _stale(job, runner, body.token):
         raise HTTPException(404)
+    if job.status in ("cancelled", "done", "failed"):     # already resolved (stopped/deleted/reassigned)
+        return {"ok": True, "ignored": True}
     tmpl = session.get(Template, job.template_id)
     target = session.get(Target, job.target_id)
     kind = tmpl.kind if tmpl else ""
@@ -276,7 +289,24 @@ def heartbeat(body: HeartbeatIn, runner: Runner = Depends(current_runner),
         runner.desired_slots = None
     session.add(runner)
     session.commit()
-    return {"ok": True, "desired_slots": runner.desired_slots}
+    # tell the agent which of the jobs it's running should STOP now — the scan was deleted (job gone), stopped
+    # (job cancelled), or the job was requeued to someone else. The agent kills those subprocesses and frees
+    # the slots, so a deleted/stopped scan doesn't keep scanning and doesn't hold the agent on stale work.
+    cancel = _jobs_to_cancel(session, runner, body.current_jobs)
+    return {"ok": True, "desired_slots": runner.desired_slots, "cancel": cancel}
+
+
+def _jobs_to_cancel(session: Session, runner: Runner, current_jobs: list[int]) -> list[int]:
+    cancel = []
+    for jid in current_jobs or []:
+        job = session.get(Job, jid)
+        if job is None or job.runner_id != runner.id or job.status not in ("claimed", "running"):
+            cancel.append(jid)                       # deleted, reassigned, or already resolved server-side
+            continue
+        scan = session.get(Scan, job.scan_id)
+        if scan is None or scan.status == "stopped":  # paused is graceful (in-flight finishes); stopped is not
+            cancel.append(jid)
+    return cancel
 
 
 # ---- fleet (users see it; admin manages enroll tokens) ------------------------------------------------------

@@ -5,6 +5,7 @@ compare-and-swap UPDATE so two agents never grab the same job (works on both SQL
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
@@ -35,7 +36,8 @@ def enqueue_scan(session: Session, scan: Scan) -> int:
         if key in existing:
             continue
         rows.append({"scan_id": scan.id, "target_id": tid, "template_id": scan.template_id,
-                     "run_no": scan.run_no, "dedup_key": key, "status": "pending", "attempts": 0,
+                     "run_no": scan.run_no, "dedup_key": key, "token": uuid.uuid4().hex,
+                     "status": "pending", "attempts": 0,
                      "argv_json": "[]", "output": "", "created_at": created})
     for i in range(0, len(rows), 1000):
         session.bulk_insert_mappings(Job, rows[i:i + 1000])

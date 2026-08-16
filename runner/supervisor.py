@@ -37,7 +37,13 @@ VERSION = "0.1.0"
 # envelope. Lets `docker compose up` / a local supervisor demonstrate claim->event->result->diff offline
 # (and never scans a real target). See BUILD.md testing notes.
 MOCK = os.environ.get("MOCK_RUNNER", "").strip().lower() not in ("", "0", "false", "no")
-JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "3600") or 3600)   # hard-kill a boxcutter job after N seconds
+# A deep scan (AI agent, big workflow) can legitimately run for hours, so we DON'T cap total runtime tightly.
+# Instead we kill a job only when it goes SILENT for JOB_IDLE_TIMEOUT (no stdout/stderr for that long = hung),
+# and keep JOB_MAX_RUNTIME as a generous runaway backstop so a chatty-but-stuck job can't wedge a slot forever.
+# Either way the job's partial output is captured and returned, so you can always see what it produced.
+JOB_IDLE_TIMEOUT = int(os.environ.get("JOB_IDLE_TIMEOUT", "1800") or 1800)   # kill if no output for N seconds
+JOB_MAX_RUNTIME = int(os.environ.get("JOB_MAX_RUNTIME", "21600") or 0)       # absolute cap (s); 0 = unlimited
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "0") or 0)                   # legacy hard cap; 0 = use the above
 _POSIX = os.name == "posix"
 
 def _local_ip() -> str:
@@ -60,6 +66,9 @@ STATE = {"connected": False, "runner_id": None, "server": "", "concurrency": 1, 
          "slots": {}, "recent": [], "metrics": {}, "error": ""}   # slots: {idx:{job,target}}; recent: last jobs
 _LOCK = threading.Lock()
 _ENROLL_LOCK = threading.Lock()             # serialize enroll so startup + heartbeat don't double-register
+CANCEL: set = set()                         # job ids the server told us to STOP (scan deleted/stopped/reassigned)
+JOB_TOKENS: dict = {}                       # job_id -> run token, echoed on every event/result so a stale post
+#                                             can't land on a reused integer id now owned by a different scan
 
 
 # ---- config -------------------------------------------------------------------------------------------------
@@ -145,7 +154,8 @@ def _scrub(text: str, secret_vals: list) -> str:
 def _emit(job_id: int, line: str, agent: str = "", phase: str = "", reasoning: str | None = None) -> None:
     try:
         _req("POST", f"/runner/jobs/{job_id}/event",
-             {"line": line[:2000], "agent": agent, "phase": phase, "reasoning": reasoning},
+             {"line": line[:2000], "agent": agent, "phase": phase, "reasoning": reasoning,
+              "token": JOB_TOKENS.get(job_id, "")},
              CFG["token"], timeout=15)
     except Exception:  # noqa: BLE001 - a dropped log line must not kill the job
         pass
@@ -204,9 +214,11 @@ def _kill_tree(proc) -> None:
 
 
 def run_job(job: dict, secrets: dict) -> dict:
-    """Run `boxcutter <argv>`, stream stderr lines as events, capture stdout as the envelope/report. Bounded by
-    JOB_TIMEOUT and guaranteed to reap the whole process tree, so a hung / runaway / OOM'd engine can never
-    wedge a worker slot — the job just comes back as failed and the slot frees up."""
+    """Run `boxcutter <argv>`, streaming stderr as live steps and capturing stdout as the findings envelope /
+    raw report. A deep scan (AI agent, big workflow) can legitimately run for hours, so instead of a hard
+    total-runtime cap we kill the job only when it goes SILENT for JOB_IDLE_TIMEOUT (a hung engine), with
+    JOB_MAX_RUNTIME as a runaway backstop. Whatever the job printed is ALWAYS captured and returned — even when
+    killed — so you can always see its output; and the whole process tree is reaped so it can't wedge a slot."""
     if MOCK:
         return _mock_run(job)
     env = dict(os.environ)
@@ -214,57 +226,88 @@ def run_job(job: dict, secrets: dict) -> dict:
     # values to redact from any streamed line or captured output (never leak the LLM key back to the server)
     secret_vals = [str(v) for v in (secrets or {}).values() if v and len(str(v)) >= 6]
     cmd = BOXCUTTER_CMD + [str(a) for a in job["argv"]]
+    # a visible first step — tools emit their JSON to stdout at the end and are silent on stderr, so without
+    # this the live-steps view would stay empty until (and unless) something prints to stderr.
+    _emit(job["id"], _scrub("$ boxcutter " + " ".join(str(a) for a in job["argv"]), secret_vals), phase="run")
+    hard_cap = JOB_TIMEOUT if JOB_TIMEOUT > 0 else JOB_MAX_RUNTIME   # legacy JOB_TIMEOUT still honored if set
+    out_buf: list = []
+    last_active = [time.monotonic()]           # bumped by EITHER stream; drives the idle timeout
+    killed = None
+    cancelled = False
     proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                                 text=True, bufsize=1,
                                 start_new_session=_POSIX)   # own process group -> we can kill the whole tree
 
-        def _pump_stderr():
+        def _pump(stream, is_stderr):
             try:
-                for line in iter(proc.stderr.readline, ""):
-                    line = line.rstrip("\n")
-                    if line:
-                        _emit(job["id"], _scrub(line, secret_vals))
+                for line in iter(stream.readline, ""):
+                    last_active[0] = time.monotonic()     # any output = the job is alive, reset the idle clock
+                    if is_stderr:
+                        s = line.rstrip("\n")
+                        if s:
+                            _emit(job["id"], _scrub(s, secret_vals))
+                    else:
+                        out_buf.append(line)              # keep raw stdout for the report (and drain the pipe)
             except Exception:  # noqa: BLE001 - a broken pipe must not crash the job
                 pass
 
-        t = threading.Thread(target=_pump_stderr, daemon=True)
-        t.start()
-        try:
-            stdout, _ = proc.communicate(timeout=JOB_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
+        te = threading.Thread(target=_pump, args=(proc.stderr, True), daemon=True)
+        to = threading.Thread(target=_pump, args=(proc.stdout, False), daemon=True)
+        te.start()
+        to.start()
+        started = time.monotonic()
+        while True:
             try:
-                proc.communicate(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
-            t.join(timeout=2)
-            return {"envelope": {}, "report": None, "error": f"timed out after {JOB_TIMEOUT}s"}
-        t.join(timeout=2)
+                proc.wait(timeout=2)
+                break                                    # engine exited on its own
+            except subprocess.TimeoutExpired:
+                with _LOCK:
+                    stop_now = job["id"] in CANCEL     # server asked us to stop (scan deleted/stopped)
+                if stop_now:
+                    killed, cancelled = "cancelled by server", True
+                else:
+                    now = time.monotonic()
+                    if JOB_IDLE_TIMEOUT and (now - last_active[0]) >= JOB_IDLE_TIMEOUT:
+                        killed = f"no output for {int(now - last_active[0])}s — idle timeout ({JOB_IDLE_TIMEOUT}s)"
+                    elif hard_cap and (now - started) >= hard_cap:
+                        killed = f"exceeded max runtime ({hard_cap}s)"
+                if killed:
+                    _emit(job["id"], killed, phase="run")
+                    _kill_tree(proc)
+                    break
+        te.join(timeout=3)
+        to.join(timeout=3)
     except FileNotFoundError:
+        _emit(job["id"], f"engine not found: {cmd[0]}", phase="run")
         return {"envelope": {}, "report": None, "error": f"engine not found: {cmd[0]} (set BOXCUTTER_CMD)"}
     except Exception as e:  # noqa: BLE001 - any launch/IO failure -> reported as a failed job, slot survives
+        _emit(job["id"], f"agent error: {e}", phase="run")
         return {"envelope": {}, "report": None, "error": f"agent error: {e}"}
     finally:
         if proc is not None and proc.poll() is None:
             _kill_tree(proc)
 
-    envelope, report, error = {}, None, None
-    text = (stdout or "").strip()
-    try:
+    envelope, error = {}, None
+    text = "".join(out_buf).strip()
+    report = text or None                 # ALWAYS keep the raw engine stdout for the debug/raw view — even a
+    try:                                   # killed job returns whatever it printed so far ("we need to see it")
         parsed = json.loads(text)
         if isinstance(parsed, dict) and ("data" in parsed or "success" in parsed):
-            envelope = parsed
-        else:
-            report = text
-    except Exception:  # noqa: BLE001 - non-JSON stdout (e.g. irvin prints a markdown report)
-        report = text
-    if proc.returncode not in (0, None):
+            envelope = parsed             # structured findings for the diff; `report` keeps the raw JSON too
+    except Exception:  # noqa: BLE001 - non-JSON / partial stdout (e.g. irvin prints a markdown report)
+        pass
+    if killed:
+        error = killed                    # a killed job is failed, but its partial output above is preserved
+    elif proc.returncode not in (0, None):
         error = f"exit {proc.returncode}"
     if report:
         report = _scrub(report, secret_vals)
-    return {"envelope": envelope, "report": report, "error": error}
+    if not cancelled:                     # a cancelled job already emitted "cancelled by server" above
+        n = len(envelope.get("data") or []) if isinstance(envelope, dict) else 0
+        _emit(job["id"], f"failed — {error}" if error else f"finished — {n} result item(s)", phase="run")
+    return {"envelope": envelope, "report": report, "error": error, "cancelled": cancelled}
 
 
 def worker(idx: int) -> None:
@@ -283,19 +326,29 @@ def worker(idx: int) -> None:
                 time.sleep(1.5)
                 continue
             started = time.time()
+            tok = job.get("token", "")
             with _LOCK:
+                JOB_TOKENS[job["id"]] = tok      # register before running so streamed events carry the token
+                CANCEL.discard(job["id"])        # a freshly claimed id starts clean — ignore any stale cancel
                 STATE["slots"][idx] = {"job": job["id"], "target": job.get("target", ""), "started": started}
             try:
                 out = run_job(job, res.get("secrets") or {})
             except Exception as e:  # noqa: BLE001 - a crashed job must never kill the slot
                 out = {"envelope": {}, "report": None, "error": f"agent error: {e}"}
-            try:
-                _req("POST", f"/runner/jobs/{job['id']}/result", out, CFG["token"], timeout=30)
-            except Exception:  # noqa: BLE001
-                pass
             with _LOCK:
+                was_cancelled = bool(out.get("cancelled")) or job["id"] in CANCEL
+            if not was_cancelled:                 # a cancelled job posts NOTHING — its integer id may already be
+                try:                               # reused by a newer scan, and the server has dropped it anyway
+                    _req("POST", f"/runner/jobs/{job['id']}/result", {**out, "token": tok},
+                         CFG["token"], timeout=30)
+                except Exception:  # noqa: BLE001
+                    pass
+            with _LOCK:
+                JOB_TOKENS.pop(job["id"], None)
+                CANCEL.discard(job["id"])
                 STATE["recent"].insert(0, {"job": job["id"], "target": job.get("target", ""),
-                                           "status": "failed" if out.get("error") else "done",
+                                           "status": "cancelled" if was_cancelled else
+                                           ("failed" if out.get("error") else "done"),
                                            "duration": round(time.time() - started, 1)})
                 STATE["recent"] = STATE["recent"][:12]
                 STATE["slots"][idx] = {"job": None, "target": ""}
@@ -395,6 +448,11 @@ def _heartbeat_once() -> None:
                     with _LOCK:
                         STATE["concurrency"] = ds
                     save_config(CFG)
+            # the server can ask us to STOP jobs it no longer wants (scan deleted/stopped/reassigned) — the
+            # running worker sees the id in CANCEL on its next poll and kills the boxcutter subprocess.
+            if isinstance(resp, dict) and resp.get("cancel"):
+                with _LOCK:
+                    CANCEL.update(int(j) for j in resp["cancel"])
             with _LOCK:
                 STATE["connected"] = True
                 STATE["error"] = ""

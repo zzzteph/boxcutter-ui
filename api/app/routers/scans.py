@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import case, delete, func, or_
+from sqlalchemy import case, delete, func, or_, update
 from sqlmodel import Session, select
 
 from ..activity import log_activity
@@ -163,16 +163,31 @@ def update_scan(scan_id: int, body: ScanPatch, user: User = Depends(current_user
     return get_scan(scan_id, user, session)
 
 
+def _delete_scan_rows(session: Session, model, scan_id: int, batch: int = 5000) -> None:
+    """Delete a scan's rows for one child table in bounded batches, committing between each. A scan can own
+    millions of findings/jobs/events; doing it in ONE transaction would hold the SQLite write lock (and grow
+    the WAL) long enough to stall every claim/heartbeat — i.e. the server would appear to hang. Batching frees
+    the lock repeatedly so the rest of the app keeps serving. Portable (no DELETE ... LIMIT): delete the ids
+    from a bounded sub-select, loop until none remain."""
+    while session.exec(select(model.id).where(model.scan_id == scan_id).limit(1)).first() is not None:
+        sub = select(model.id).where(model.scan_id == scan_id).limit(batch)
+        session.execute(delete(model).where(model.id.in_(sub)))
+        session.commit()
+
+
 @router.delete("/{scan_id}")
 def delete_scan(scan_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    """Delete a scan and everything it owns. Set-based deletes (a scan can have 100k+ findings/jobs), children
-    first so no foreign keys dangle."""
+    """Delete a scan and everything it owns. Batched, children first so no foreign key dangles, and the scan is
+    marked non-claimable up front so no new work is claimed (and in-flight agents drop it) while we delete."""
     scan = session.get(Scan, scan_id)
     if not scan or not _perm(session, scan, user):
         raise HTTPException(404, "not found")
     name = scan.name
+    scan.status = "stopped"                    # stop new claims + let agents drop in-flight jobs during delete
+    session.add(scan)
+    session.commit()
     for model in (Finding, JobEvent, Job, Target, Activity):
-        session.execute(delete(model).where(model.scan_id == scan_id))
+        _delete_scan_rows(session, model, scan_id)
     session.delete(scan)
     session.commit()
     log_activity(session, "scan_deleted", f"Scan '{name}' deleted")     # scan_id omitted — the row is gone
@@ -438,9 +453,11 @@ def _set_status(scan_id, new, user, session, cancel_pending=False, bump_run=Fals
     scan.status = new
     session.add(scan)
     if cancel_pending:
-        for j in session.exec(select(Job).where(Job.scan_id == scan_id, Job.status == "pending")).all():
-            j.status = "cancelled"
-            session.add(j)
+        # Stop cancels ALL unfinished work — pending AND in-flight (claimed/running). Set-based so it stays fast
+        # for a 100k-job scan. The agent learns its in-flight jobs are cancelled on its next heartbeat and kills
+        # the running boxcutter subprocesses (see runners._jobs_to_cancel).
+        session.execute(update(Job).where(
+            Job.scan_id == scan_id, Job.status.in_(["pending", "claimed", "running"])).values(status="cancelled"))
     session.commit()
     jobs = enqueue_scan(session, scan) if bump_run else 0
     if bump_run:
