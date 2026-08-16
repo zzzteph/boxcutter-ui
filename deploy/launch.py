@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""boxcutter-standalone launcher.
+"""boxcutter-server launcher (the all-in-one image).
 
 Runs the whole product in ONE container: the server (API + SPA on :8000) plus one built-in agent that
 auto-enrolls to the local server. For a quick single-host deploy:
 
-    docker run -d -p 8000:8000 -v boxcutter-data:/app/data ghcr.io/zzzteph/boxcutter-standalone
+    docker run -d -p 8000:8000 -v boxcutter-data:/app/data ghcr.io/zzzteph/boxcutter-server
 
-The built-in agent runs CONCURRENCY scans in parallel (default 4). To scale out, add more separate
-boxcutter-agent containers pointed at this server's URL — this one keeps working alongside them.
+The built-in agent starts IDLE (0 boxcutters) by default — raise it from the Scanners page when you want the
+server host itself to scan. It is a permanent fixture: you can set its concurrency to 0 or more, but it can't
+be removed. To scale out, add separate boxcutter-agent containers pointed at this server's URL.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ import urllib.request
 
 
 def log(msg: str) -> None:
-    print(f"[standalone] {msg}", flush=True)
+    print(f"[boxcutter] {msg}", flush=True)
 
 
 def wait_healthy(proc: subprocess.Popen, url: str, tries: int = 90) -> bool:
@@ -59,10 +60,14 @@ def main() -> int:
     agent_env = dict(os.environ)
     agent_env["SERVER_URL"] = "http://127.0.0.1:8000"
     agent_env["ENROLL_TOKEN"] = token
-    agent_env.setdefault("CONCURRENCY", "4")
+    agent_env["RUNNER_INTERNAL"] = "1"                      # a permanent, non-removable singleton runner
+    agent_env.setdefault("CONCURRENCY", "0")               # idle by default — raise it from the Scanners page
+    # persist the agent's token/concurrency in the data volume so it stays the SAME internal runner across
+    # restarts (and remembers the concurrency you set) instead of re-enrolling from scratch
+    agent_env.setdefault("RUNNER_CONFIG", "/app/data/.runner-config.json")
     agent_env.setdefault("RUNNER_UI_PORT", "7070")
-    agent_env.setdefault("RUNNER_NAME", "standalone")
-    log(f"starting built-in agent (concurrency={agent_env['CONCURRENCY']})")
+    agent_env.setdefault("RUNNER_NAME", "built-in")
+    log(f"starting built-in agent (concurrency={agent_env['CONCURRENCY']}, internal)")
     agent = subprocess.Popen([sys.executable, "/supervisor.py"], env=agent_env)
 
     procs = {"server": server, "agent": agent}

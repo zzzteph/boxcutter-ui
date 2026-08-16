@@ -129,6 +129,24 @@ def test_run_job_cancelled_by_server_kills_and_flags():
     assert out["error"] == "cancelled by server"
 
 
+def test_agent_enroll_marks_internal():
+    """The built-in agent (RUNNER_INTERNAL) must send internal=true on enroll so the server keeps it as the
+    permanent singleton it won't let you delete."""
+    sup = _load_supervisor()
+    captured = {}
+
+    def fake_req(method, path, body=None, *a, **k):
+        captured["path"], captured["body"] = path, body
+        return {"runner_token": "t", "runner_id": 1}
+
+    sup._req = fake_req
+    sup.CFG.update({"internal": True, "enroll_token": "x", "token": ""})
+    sup.STATE["connected"] = False
+    assert sup._enroll_locked() is True
+    assert captured["path"] == "/runner/enroll"
+    assert captured["body"].get("internal") is True
+
+
 def test_agent_login_is_local_and_settable():
     """The agent UI login is self-contained (root + a settable local password) and never delegates to the
     server — so a scanner stays manageable regardless of the server's credentials/state."""

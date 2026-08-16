@@ -38,9 +38,10 @@ onUnmounted(() => clearInterval(timer))
     <div class="row" style="justify-content:space-between">
       <h1>{{ r.name || ('runner #' + r.id) }}
         <span class="state" :class="r.status === 'disconnected' ? 'st-stopped' : 'st-done'">{{ r.status }}</span>
+        <span v-if="r.internal" class="tag sm" title="Built-in agent — can't be removed">built-in</span>
       </h1>
       <div class="row" style="gap:8px">
-        <button v-if="admin" class="danger ghost" @click="delRunner">Remove scanner</button>
+        <button v-if="admin && !r.internal" class="danger ghost" @click="delRunner">Remove scanner</button>
         <router-link to="/scanners" class="btn">← Scanners</router-link>
       </div>
     </div>

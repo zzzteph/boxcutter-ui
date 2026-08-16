@@ -160,6 +160,8 @@ class Runner(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(default="", max_length=150)
     host: str = Field(default="", max_length=255)
+    internal: bool = False                                    # the all-in-one server's built-in agent: a permanent
+    #                                                           singleton — concurrency-adjustable but NOT removable
     ip: str = Field(default="", max_length=64)                # the agent host's IP, reported at enroll/heartbeat
     version: str = Field(default="", max_length=40)
     status: str = Field(default="idle", max_length=24)        # idle | busy | disconnected (from last_heartbeat)

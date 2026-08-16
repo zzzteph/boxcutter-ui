@@ -80,6 +80,7 @@ def load_config() -> dict:
            "password": os.environ.get("RUNNER_PASSWORD", ""),
            "concurrency": int(os.environ.get("CONCURRENCY", "2") or 2),
            "name": os.environ.get("RUNNER_NAME", os.uname().nodename if hasattr(os, "uname") else "runner"),
+           "internal": os.environ.get("RUNNER_INTERNAL", "").strip().lower() not in ("", "0", "false", "no"),
            "token": ""}
     if os.path.exists(CONFIG_PATH):
         try:
@@ -121,7 +122,7 @@ def enroll() -> bool:
 
 def _enroll_locked() -> bool:
     body = {"name": CFG.get("name", "runner"), "version": VERSION, "slots": CFG.get("concurrency", 1),
-            "host": CFG.get("name", ""), "ip": _IP}
+            "host": CFG.get("name", ""), "ip": _IP, "internal": bool(CFG.get("internal"))}
     if CFG.get("enroll_token"):
         body["token"] = CFG["enroll_token"]
     elif CFG.get("api_key"):

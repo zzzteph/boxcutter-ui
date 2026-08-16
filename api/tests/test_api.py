@@ -352,6 +352,27 @@ def test_result_token_guard_rejects_reused_id(client):
     assert ok.status_code == 200
 
 
+def test_internal_agent_is_singleton_and_not_removable(client):
+    """The all-in-one server's built-in agent is a permanent singleton: re-enrolling it reuses the one internal
+    row, its concurrency is adjustable (incl. 0), but it can never be removed."""
+    h = auth(login(client))
+    e1 = client.post("/runner/enroll",
+                     json={"token": "test-enroll", "name": "built-in", "slots": 0, "internal": True}).json()
+    rid = e1["runner_id"]
+    # re-enroll (as after a server restart that lost the local token) → SAME row, not a duplicate
+    e2 = client.post("/runner/enroll",
+                     json={"token": "test-enroll", "name": "built-in", "slots": 0, "internal": True}).json()
+    assert e2["runner_id"] == rid
+    internal_rows = [r for r in client.get("/runners", headers=h).json() if r.get("internal")]
+    assert len(internal_rows) == 1 and internal_rows[0]["id"] == rid
+    assert internal_rows[0]["slots"] == 0                       # idle by default
+    # concurrency is adjustable
+    assert client.patch(f"/runners/{rid}", json={"concurrency": 3}, headers=h).status_code == 200
+    # but it can NOT be removed
+    assert client.delete(f"/runners/{rid}", headers=h).status_code == 400
+    assert any(r["id"] == rid for r in client.get("/runners", headers=h).json())   # still there
+
+
 def test_reachable_recon_is_not_a_finding(client):
     h = auth(login(client))
     tid = _tool_template(client, h, name="recon-t")

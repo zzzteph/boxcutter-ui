@@ -25,6 +25,7 @@ _ADDED_COLUMNS = [
     ("user", "totp_enabled", "BOOLEAN", "0"),
     ("template", "description", "TEXT", "''"),
     ("job", "token", "VARCHAR(32)", "''"),
+    ("runner", "internal", "BOOLEAN", "0"),
 ]
 
 

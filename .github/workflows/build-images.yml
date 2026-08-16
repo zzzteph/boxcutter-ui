@@ -1,16 +1,15 @@
 name: build-images
 
 # Builds and pushes images to GHCR so you can deploy them straight onto servers (no local build):
-#   ghcr.io/<owner>/boxcutter-server      the API + built SPA (single origin) — multi-arch: amd64 + arm64
-#   ghcr.io/<owner>/boxcutter-agent       the scanner (boxcutter image + supervisor) — amd64 only, see below
-#   ghcr.io/<owner>/boxcutter-standalone  server + one built-in agent in one container — amd64 only
+#   ghcr.io/<owner>/boxcutter-server   all-in-one: API + built SPA + one built-in agent — multi-arch amd64+arm64
+#   ghcr.io/<owner>/boxcutter-agent    the scale-out scanner (boxcutter image + supervisor) — multi-arch amd64+arm64
 #
 # Runs on pushes to the default branch, on version tags (v1.2.3), and on demand. Each build produces a
 # multi-arch manifest, so `docker pull …:latest` picks the right architecture automatically.
 #
-# The agent is FROM ghcr.io/zzzteph/boxcutter, whose `latest` is amd64 (x64) only — so the agent is built for
-# amd64 only (an arm64 build would fail: no arm64 base). Once that base publishes arm64, add linux/arm64 to the
-# agent's `platforms` below and it becomes multi-arch too.
+# Both images are FROM ghcr.io/zzzteph/boxcutter, whose `latest` manifest carries amd64 AND arm64 — so both
+# architectures build cleanly. (If that base ever drops an arch, the matching build here would fail until it's
+# republished.)
 #
 # If the base image is PRIVATE, add a repo secret GHCR_TOKEN (a PAT with read:packages for the base +
 # write:packages to push); it's used automatically below. If the base is public, GITHUB_TOKEN is enough.
@@ -52,15 +51,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: boxcutter-server   # single Dockerfile, `server` target: build SPA + API, one origin
+          - name: boxcutter-server   # `server` target: all-in-one (SPA + API + built-in agent), one origin
             target: server
             platforms: linux/amd64,linux/arm64
-          - name: boxcutter-agent    # `agent` target: base ghcr.io/zzzteph/boxcutter is amd64-only
+          - name: boxcutter-agent    # `agent` target: the scale-out scanner
             target: agent
-            platforms: linux/amd64
-          - name: boxcutter-standalone   # server + one built-in agent in one container (engine base = amd64)
-            target: standalone
-            platforms: linux/amd64
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v4
 

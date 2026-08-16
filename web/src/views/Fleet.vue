@@ -46,7 +46,8 @@ onUnmounted(() => clearInterval(timer))
     <tbody>
       <tr v-for="r in runners" :key="r.id" @click="open(r)" style="cursor:pointer">
         <td data-label=""><span class="dot" :class="r.status === 'disconnected' ? 'bad' : (r.status === 'busy' ? 'busy' : 'ok')"></span></td>
-        <td data-label="Scanner"><b>{{ r.name || ('runner #' + r.id) }}</b></td>
+        <td data-label="Scanner"><b>{{ r.name || ('runner #' + r.id) }}</b>
+          <span v-if="r.internal" class="tag sm" title="Built-in agent — can't be removed">built-in</span></td>
         <td data-label="IP"><code>{{ r.ip || '—' }}</code></td>
         <td data-label="Status">{{ r.status }}</td>
         <td data-label="Slots">
@@ -77,7 +78,7 @@ onUnmounted(() => clearInterval(timer))
         <td data-label="Last beat">
           <div class="row" style="gap:8px;align-items:center;flex-wrap:nowrap;justify-content:space-between">
             <span>{{ timeAgo(r.last_heartbeat) }}</span>
-            <button v-if="admin" class="danger ghost sm" title="Remove scanner" @click.stop="delRunner(r)">Remove</button>
+            <button v-if="admin && !r.internal" class="danger ghost sm" title="Remove scanner" @click.stop="delRunner(r)">Remove</button>
           </div>
         </td>
       </tr>
