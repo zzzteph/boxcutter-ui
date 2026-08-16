@@ -53,6 +53,10 @@ def _spec_params_to_argv(spec: dict) -> list:
     return _kv_to_argv(spec.get("params", [])) + [str(f) for f in (spec.get("flags", []) or [])]
 
 
+# per-kind flags that make boxcutter narrate live progress to stderr (see each subcommand's --help)
+_PROGRESS_FLAGS = {"tool": ("--debug",), "workflow": ("--steps", "--show-findings")}
+
+
 def build_argv(session: Session, tmpl: Template, target: str, scan: Scan | None = None):
     """Map a template + target (+ the scan's own inputs) to a boxcutter CLI argv and any secret env it needs.
     All kinds run as `boxcutter <argv>` (the CLI desugars agent/tool/workflow names). Template params are the
@@ -94,6 +98,13 @@ def build_argv(session: Session, tmpl: Template, target: str, scan: Scan | None 
             argv += ["--creds", creds]
     argv += _spec_params_to_argv(spec)                       # template-level params
     argv += _kv_to_argv(vars_.get("custom", []))             # scan-specific custom params (any kind)
+    # Make the engine narrate its progress to stderr so the live-steps view fills in AS the scan runs. Tools are
+    # silent by default (--debug); workflows print each step + finding as it happens (--steps --show-findings);
+    # AI agents already stream their own reasoning. All go to stderr, which the runner forwards as live events —
+    # the final JSON on stdout (findings / raw output) is unchanged. Skip any flag the template already set.
+    for flag in _PROGRESS_FLAGS.get(tmpl.kind, ()):
+        if flag not in argv:
+            argv.append(flag)
     return argv, secrets_env
 
 

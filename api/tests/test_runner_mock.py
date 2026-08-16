@@ -100,6 +100,23 @@ def test_run_job_emits_lifecycle_steps():
     assert out["report"] and '"data"' in out["report"]
 
 
+def test_run_job_streams_stdout_progress_but_not_the_envelope():
+    """Human-readable stdout is surfaced live (so you can watch the output as it runs), but the final JSON
+    envelope is NOT spammed into the live feed — it's kept as the raw report / parsed into findings."""
+    import sys
+    sup = _load_supervisor()
+    emitted = []
+    sup._emit = lambda job_id, line, **k: emitted.append(line)
+    sup.MOCK = False
+    sup.BOXCUTTER_CMD = [sys.executable, "-c",
+                         "print('crawling https://x/'); print('{\"success\": true, \"data\": []}')"]
+    out = sup.run_job({"id": 1, "argv": ["workflow", "web-full", "x"], "target": "x"}, {})
+    assert out["error"] is None
+    assert any("crawling https://x/" in l for l in emitted)                 # progress line surfaced live
+    assert not any(l.lstrip().startswith("{") and '"data"' in l for l in emitted)   # envelope NOT in the feed
+    assert out["report"] and '"data"' in out["report"]                     # envelope still kept as raw output
+
+
 def test_run_job_cancelled_by_server_kills_and_flags():
     """When the server puts a running job's id in CANCEL (scan deleted/stopped), run_job kills the subprocess
     promptly, flags the result as cancelled, and does NOT report it as finished — the worker then posts nothing

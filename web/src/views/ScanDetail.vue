@@ -23,6 +23,7 @@ function onJobStatus() { jobOffset.value = 0; loadJobs() }
 const scan = ref(null)
 const events = ref([])
 const cursor = ref(0)
+const seenEvents = new Set()             // de-dupe: the seed load + SSE/poll can deliver the same event twice
 
 // assets (jobs)
 const jobs = ref([]); const jobsTotal = ref(0); const jobCounts = ref({}); const jobOffset = ref(0)
@@ -90,7 +91,15 @@ async function refresh() {
     if (!es) { const ev = await api.get('/scans/' + id + '/events?since=' + cursor.value); if (ev.length) pushEvents(ev) }
   } catch (e) { /* transient */ }
 }
-function pushEvents(list) { for (const e of list) { events.value.push(e); if (e.cursor > cursor.value) cursor.value = e.cursor } }
+function pushEvents(list) {
+  for (const e of list) {
+    const key = e.cursor != null ? e.cursor : `${e.job_id}:${e.seq}`
+    if (seenEvents.has(key)) continue          // drop a duplicate (same event from seed + stream/poll)
+    seenEvents.add(key)
+    events.value.push(e)
+    if (e.cursor > cursor.value) cursor.value = e.cursor
+  }
+}
 function startStream() {
   try {
     es = new EventSource(`${apiBase()}/scans/${id}/stream?since=${cursor.value}&access_token=${encodeURIComponent(token())}`)
@@ -114,7 +123,8 @@ function fPage(d) { fOffset.value = Math.max(0, fOffset.value + d * FLIMIT); loa
 function applyFindingFilters() { fOffset.value = 0; loadFindings() }
 
 onMounted(async () => {
-  await refresh()
+  // load the tables WITHOUT events (refresh() would also poll events and race the seed below → duplicates)
+  await Promise.all([loadScan(), loadJobs(), loadFindings()]).catch(() => {})
   const seed = await api.get('/scans/' + id + '/events?since=0').catch(() => [])
   if (seed.length) pushEvents(seed)
   startStream()
@@ -175,7 +185,7 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
               <b style="font-size:13px">Live steps</b>
               <div class="log" style="max-height:180px">{{ assetLog || 'no steps yet' }}</div>
               <b style="font-size:13px">Raw output</b>
-              <div class="log" style="max-height:220px">{{ j.output || '(no engine stdout captured)' }}</div>
+              <div class="log" style="max-height:220px">{{ j.output || (['pending','claimed','running'].includes(j.status) ? '(still running — the engine prints its output when the step finishes)' : '(no engine stdout captured)') }}</div>
             </td>
           </tr>
         </template>

@@ -37,11 +37,13 @@ VERSION = "0.1.0"
 # envelope. Lets `docker compose up` / a local supervisor demonstrate claim->event->result->diff offline
 # (and never scans a real target). See BUILD.md testing notes.
 MOCK = os.environ.get("MOCK_RUNNER", "").strip().lower() not in ("", "0", "false", "no")
-# A deep scan (AI agent, big workflow) can legitimately run for hours, so we DON'T cap total runtime tightly.
-# Instead we kill a job only when it goes SILENT for JOB_IDLE_TIMEOUT (no stdout/stderr for that long = hung),
-# and keep JOB_MAX_RUNTIME as a generous runaway backstop so a chatty-but-stuck job can't wedge a slot forever.
-# Either way the job's partial output is captured and returned, so you can always see what it produced.
-JOB_IDLE_TIMEOUT = int(os.environ.get("JOB_IDLE_TIMEOUT", "1800") or 1800)   # kill if no output for N seconds
+# A deep scan can legitimately run a long time while SILENT — a single sqlmap / full-ZAP / nuclei step produces
+# no output for a while, and --steps only prints at step boundaries. So an idle timeout easily kills real work.
+# By default we therefore DON'T idle-kill (JOB_IDLE_TIMEOUT=0); JOB_MAX_RUNTIME is the only bound — a generous
+# backstop so a truly wedged job can't hold a slot forever. Set JOB_IDLE_TIMEOUT>0 to re-enable silence
+# detection. While the engine is quiet we emit a periodic "still running" keepalive so a live job never looks
+# dead, and whatever it printed is captured/returned even if it is killed.
+JOB_IDLE_TIMEOUT = int(os.environ.get("JOB_IDLE_TIMEOUT", "0") or 0)         # kill if silent N seconds (0 = off)
 JOB_MAX_RUNTIME = int(os.environ.get("JOB_MAX_RUNTIME", "21600") or 0)       # absolute cap (s); 0 = unlimited
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "0") or 0)                   # legacy hard cap; 0 = use the above
 _POSIX = os.name == "posix"
@@ -245,12 +247,16 @@ def run_job(job: dict, secrets: dict) -> dict:
             try:
                 for line in iter(stream.readline, ""):
                     last_active[0] = time.monotonic()     # any output = the job is alive, reset the idle clock
+                    s = line.rstrip("\n")
                     if is_stderr:
-                        s = line.rstrip("\n")
                         if s:
                             _emit(job["id"], _scrub(s, secret_vals))
                     else:
                         out_buf.append(line)              # keep raw stdout for the report (and drain the pipe)
+                        # surface human-readable stdout progress live too — but not the final JSON envelope
+                        # blob (that's shown under Raw output and parsed into findings), so the feed stays clean
+                        if s and not (s.lstrip()[:1] == "{" and ('"data"' in s or '"success"' in s)):
+                            _emit(job["id"], _scrub(s, secret_vals), phase="out")
             except Exception:  # noqa: BLE001 - a broken pipe must not crash the job
                 pass
 
@@ -259,21 +265,28 @@ def run_job(job: dict, secrets: dict) -> dict:
         te.start()
         to.start()
         started = time.monotonic()
+        last_beat = started
         while True:
             try:
                 proc.wait(timeout=2)
                 break                                    # engine exited on its own
             except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                # keepalive: when the engine goes quiet, periodically show the job is still alive so a long
+                # silent step never looks dead. This does NOT touch last_active (the idle clock tracks ENGINE
+                # output only), so it can't mask a real hang.
+                if now - last_active[0] >= 45 and now - last_beat >= 60:
+                    _emit(job["id"], f"still running — {int(now - started)}s elapsed, "
+                          f"{int(now - last_active[0])}s since last engine output", phase="run")
+                    last_beat = now
                 with _LOCK:
                     stop_now = job["id"] in CANCEL     # server asked us to stop (scan deleted/stopped)
                 if stop_now:
                     killed, cancelled = "cancelled by server", True
-                else:
-                    now = time.monotonic()
-                    if JOB_IDLE_TIMEOUT and (now - last_active[0]) >= JOB_IDLE_TIMEOUT:
-                        killed = f"no output for {int(now - last_active[0])}s — idle timeout ({JOB_IDLE_TIMEOUT}s)"
-                    elif hard_cap and (now - started) >= hard_cap:
-                        killed = f"exceeded max runtime ({hard_cap}s)"
+                elif JOB_IDLE_TIMEOUT and (now - last_active[0]) >= JOB_IDLE_TIMEOUT:
+                    killed = f"no output for {int(now - last_active[0])}s — idle timeout ({JOB_IDLE_TIMEOUT}s)"
+                elif hard_cap and (now - started) >= hard_cap:
+                    killed = f"exceeded max runtime ({hard_cap}s)"
                 if killed:
                     _emit(job["id"], killed, phase="run")
                     _kill_tree(proc)

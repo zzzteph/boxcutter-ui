@@ -294,9 +294,34 @@ def test_edit_template(client):
     sid = client.post("/scans", json={"name": "edited", "template_id": tid,
                                       "targets": ["example.com"], "authorized": True}, headers=h).json()["id"]
     claimed = FakeRunner(client, name="edit-runner").claim()["job"]
-    assert claimed["argv"] == ["httpx", "example.com", "--rate", "50"]
+    assert claimed["argv"] == ["httpx", "example.com", "--rate", "50", "--debug"]
     # a bad kind is rejected
     assert client.patch(f"/templates/{tid}", json={"kind": "nope"}, headers=h).status_code == 400
+
+
+def test_progress_flags_added_per_kind(client):
+    """Tools get --debug, workflows get --steps/--show-findings so boxcutter narrates progress to stderr (which
+    the runner forwards as live steps); AI agents stream their own reasoning and get neither."""
+    from sqlmodel import Session
+    from app.db import engine
+    from app.models import Template
+    from app.routers.runners import build_argv
+    with Session(engine) as s:
+        t = Template(name="pf-tool", kind="tool", spec_json='{"name":"httpx","params":[]}', owner_id=1)
+        w = Template(name="pf-wf", kind="workflow", spec_json='{"name":"recon","params":[]}', owner_id=1)
+        a = Template(name="pf-ai", kind="ai_agent", spec_json='{"name":"irvin","params":[]}', owner_id=1)
+        for x in (t, w, a):
+            s.add(x)
+        s.commit()
+        for x in (t, w, a):
+            s.refresh(x)
+        argv_t, _ = build_argv(s, t, "example.com")
+        assert argv_t[:2] == ["httpx", "example.com"] and "--debug" in argv_t
+        argv_w, _ = build_argv(s, w, "example.com")
+        assert argv_w[:3] == ["workflow", "recon", "example.com"]
+        assert "--steps" in argv_w and "--show-findings" in argv_w
+        argv_a, _ = build_argv(s, a, "example.com")
+        assert "--debug" not in argv_a and "--steps" not in argv_a   # agents stream on their own
 
 
 def test_stop_cancels_inflight_and_heartbeat_tells_agent(client):
@@ -470,7 +495,7 @@ def test_scan_jobs_debug_view(client):
     runner.result(job["id"], data=[{"severity": "low", "title": "h", "url": "http://example.com", "cls": "headers"}],
                   report="RAW ENGINE OUTPUT\nline 2")
     dbg = client.get(f"/scans/{sid}/jobs", headers=h).json()["items"]
-    assert dbg and dbg[0]["command"] == "boxcutter httpx example.com"
+    assert dbg and dbg[0]["command"] == "boxcutter httpx example.com --debug"
     assert "RAW ENGINE OUTPUT" in dbg[0]["output"] and dbg[0]["status"] == "done"
 
 
@@ -832,8 +857,9 @@ def test_build_argv_subcommand_by_kind():
             self.kind, self.context, self.llm_profile_id = kind, None, None
             self.spec_json = _json.dumps({"name": name, "params": []})
 
-    assert build_argv(None, _T("tool", "httpx"), "example.com")[0] == ["httpx", "example.com"]
-    assert build_argv(None, _T("workflow", "web-full"), "example.com")[0] == ["workflow", "web-full", "example.com"]
+    assert build_argv(None, _T("tool", "httpx"), "example.com")[0] == ["httpx", "example.com", "--debug"]
+    assert build_argv(None, _T("workflow", "web-full"), "example.com")[0] == \
+        ["workflow", "web-full", "example.com", "--steps", "--show-findings"]
     assert build_argv(None, _T("ai_agent", "irvin"), "example.com")[0] == ["ai", "irvin", "example.com"]
 
 
