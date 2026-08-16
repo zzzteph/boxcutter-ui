@@ -74,6 +74,25 @@ def test_run_job_hard_cap_kills_chatty_runaway():
     assert out["error"] and "runtime" in out["error"]
 
 
+def test_idle_timeout_off_by_default_but_max_runtime_still_bounds_silent_jobs():
+    """The idle timeout is OFF by default (0) so a long SILENT step (sqlmap/ZAP) isn't falsely killed — but the
+    absolute JOB_MAX_RUNTIME still bounds a silent job so it can't hang a slot forever."""
+    import sys
+    import time as _t
+    sup = _load_supervisor()
+    assert sup.JOB_IDLE_TIMEOUT == 0                  # default: no idle kill
+    sup._req = lambda *a, **k: {}
+    sup._emit = lambda *a, **k: None
+    sup.MOCK = False
+    sup.JOB_MAX_RUNTIME = 1
+    sup.JOB_TIMEOUT = 0
+    sup.BOXCUTTER_CMD = [sys.executable, "-c", "import time; time.sleep(30)"]   # silent
+    t0 = _t.time()
+    out = sup.run_job({"id": 1, "argv": [], "target": "x"}, {})
+    assert _t.time() - t0 < 15
+    assert out["error"] and "runtime" in out["error"]   # bounded by max runtime, NOT an idle timeout
+
+
 def test_run_job_missing_engine_is_reported_not_crashed():
     sup = _load_supervisor()
     sup._req = lambda *a, **k: {}
