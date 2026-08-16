@@ -46,6 +46,10 @@ MOCK = os.environ.get("MOCK_RUNNER", "").strip().lower() not in ("", "0", "false
 JOB_IDLE_TIMEOUT = int(os.environ.get("JOB_IDLE_TIMEOUT", "0") or 0)         # kill if silent N seconds (0 = off)
 JOB_MAX_RUNTIME = int(os.environ.get("JOB_MAX_RUNTIME", "21600") or 0)       # absolute cap (s); 0 = unlimited
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "0") or 0)                   # legacy hard cap; 0 = use the above
+# Flood guard: stop STREAMING live-log lines for a job past this many (a --debug tool can spew thousands) so we
+# don't hammer the server or balloon its log table. The raw report (Raw output) still keeps everything, and the
+# server also ring-buffers per job (log_max_events_per_job). 0 = no agent-side cap.
+LOG_MAX_LIVE_LINES = int(os.environ.get("LOG_MAX_LIVE_LINES", "3000") or 0)
 _POSIX = os.name == "posix"
 
 def _local_ip() -> str:
@@ -243,6 +247,19 @@ def run_job(job: dict, secrets: dict) -> dict:
                                 text=True, bufsize=1,
                                 start_new_session=_POSIX)   # own process group -> we can kill the whole tree
 
+        live_lines = [0]                          # streamed live-log lines for this job (flood guard)
+
+        def _emit_line(line, **kw):
+            n = live_lines[0]                     # racy across the two pump threads, but only a soft bound
+            if LOG_MAX_LIVE_LINES and n >= LOG_MAX_LIVE_LINES:
+                if n == LOG_MAX_LIVE_LINES:
+                    _emit(job["id"], f"… live log capped at {LOG_MAX_LIVE_LINES} lines — full output under Raw "
+                          "output", phase="run")
+                    live_lines[0] += 1
+                return
+            _emit(job["id"], line, **kw)
+            live_lines[0] += 1
+
         def _pump(stream, is_stderr):
             try:
                 for line in iter(stream.readline, ""):
@@ -250,13 +267,13 @@ def run_job(job: dict, secrets: dict) -> dict:
                     s = line.rstrip("\n")
                     if is_stderr:
                         if s:
-                            _emit(job["id"], _scrub(s, secret_vals))
+                            _emit_line(_scrub(s, secret_vals))
                     else:
-                        out_buf.append(line)              # keep raw stdout for the report (and drain the pipe)
+                        out_buf.append(line)              # the report keeps EVERYTHING (never capped)
                         # surface human-readable stdout progress live too — but not the final JSON envelope
                         # blob (that's shown under Raw output and parsed into findings), so the feed stays clean
                         if s and not (s.lstrip()[:1] == "{" and ('"data"' in s or '"success"' in s)):
-                            _emit(job["id"], _scrub(s, secret_vals), phase="out")
+                            _emit_line(_scrub(s, secret_vals), phase="out")
             except Exception:  # noqa: BLE001 - a broken pipe must not crash the job
                 pass
 

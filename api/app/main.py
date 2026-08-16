@@ -15,7 +15,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import PlainTextResponse
 from sqlmodel import Session
 
-from .activity import prune_logs
+from .activity import cap_job_events, prune_logs
 from .config import settings
 from .db import engine, init_db
 from .queue import requeue_stale
@@ -30,8 +30,9 @@ async def _sweeper() -> None:
             with Session(engine) as s:
                 requeue_stale(s)
                 cycle += 1
-                if cycle % 20 == 0:      # ~ every 10 min: trim activity + job-event log rows past retention
+                if cycle % 20 == 0:      # ~ every 10 min: trim log rows past retention + cap each job's live log
                     prune_logs(s, settings.activity_retention_days)
+                    cap_job_events(s, settings.log_max_events_per_job)
         except Exception:  # noqa: BLE001 - the sweeper must never die
             pass
         await asyncio.sleep(30)

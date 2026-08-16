@@ -23,7 +23,7 @@ function onJobStatus() { jobOffset.value = 0; loadJobs() }
 const scan = ref(null)
 const events = ref([])
 const cursor = ref(0)
-const seenEvents = new Set()             // de-dupe: the seed load + SSE/poll can deliver the same event twice
+const MAX_EVENTS = 3000                   // bound the browser on a long, chatty scan (full log stays server-side)
 
 // assets (jobs)
 const jobs = ref([]); const jobsTotal = ref(0); const jobCounts = ref({}); const jobOffset = ref(0)
@@ -93,12 +93,12 @@ async function refresh() {
 }
 function pushEvents(list) {
   for (const e of list) {
-    const key = e.cursor != null ? e.cursor : `${e.job_id}:${e.seq}`
-    if (seenEvents.has(key)) continue          // drop a duplicate (same event from seed + stream/poll)
-    seenEvents.add(key)
+    if (e.cursor != null && e.cursor <= cursor.value) continue   // already seen — events arrive in id order
     events.value.push(e)
-    if (e.cursor > cursor.value) cursor.value = e.cursor
+    if (e.cursor != null && e.cursor > cursor.value) cursor.value = e.cursor
   }
+  const over = events.value.length - MAX_EVENTS
+  if (over > 0) events.value.splice(0, over)          // drop oldest; the full history stays in the DB
 }
 function startStream() {
   try {

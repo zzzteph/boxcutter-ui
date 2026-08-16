@@ -720,6 +720,26 @@ def test_prune_logs_by_age(client):
         assert prune_logs(s, 0) == 0                        # retention disabled -> no-op
 
 
+def test_cap_job_events_ring_buffers_per_job(client):
+    """Beyond age-based pruning, the live log is bounded by SIZE: cap_job_events keeps only the newest N events
+    per job (a ring buffer) and leaves other jobs untouched — so a chatty run can't balloon the table."""
+    from sqlmodel import Session, select
+    from app.db import engine
+    from app.models import JobEvent
+    from app.activity import cap_job_events
+    with Session(engine) as s:
+        for i in range(50):
+            s.add(JobEvent(job_id=990001, scan_id=990, line=f"line {i}"))
+        s.add(JobEvent(job_id=990002, scan_id=990, line="other job"))     # a different job — must survive
+        s.commit()
+        assert cap_job_events(s, max_per_job=10) == 40                     # 50 -> keep newest 10, drop 40
+        kept = s.exec(select(JobEvent).where(JobEvent.job_id == 990001).order_by(JobEvent.id)).all()
+        assert len(kept) == 10 and kept[-1].line == "line 49"             # the NEWEST survive
+        assert s.exec(select(JobEvent).where(JobEvent.job_id == 990002)).one().line == "other job"
+        assert cap_job_events(s, max_per_job=10) == 0                      # already capped -> no-op
+        assert cap_job_events(s, 0) == 0                                   # disabled -> no-op
+
+
 def test_login_rate_limited(client):
     import app.routers.auth as auth_mod
     auth_mod._login_fails.clear()

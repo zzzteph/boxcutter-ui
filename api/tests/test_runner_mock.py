@@ -136,6 +136,27 @@ def test_run_job_streams_stdout_progress_but_not_the_envelope():
     assert out["report"] and '"data"' in out["report"]                     # envelope still kept as raw output
 
 
+def test_run_job_caps_live_lines_but_keeps_report():
+    """A tool that spews thousands of lines to stderr must not flood the live log — the agent caps streamed
+    lines per job (with a truncation notice), while the raw stdout report is untouched."""
+    import sys
+    sup = _load_supervisor()
+    emitted = []
+    sup._emit = lambda job_id, line, **k: emitted.append(line)
+    sup.MOCK = False
+    sup.LOG_MAX_LIVE_LINES = 20
+    sup.JOB_IDLE_TIMEOUT = 0
+    sup.JOB_MAX_RUNTIME = 0
+    sup.BOXCUTTER_CMD = [sys.executable, "-c",
+                         "import sys\nfor i in range(500): print('noise %d' % i, file=sys.stderr)\n"
+                         "print('{\"success\": true, \"data\": []}')"]
+    out = sup.run_job({"id": 1, "argv": ["nuclei", "x"], "target": "x"}, {})
+    noise = [l for l in emitted if l.startswith("noise ")]
+    assert len(noise) <= 22                               # ~cap (20), NOT 500
+    assert any("live log capped" in l for l in emitted)   # the truncation notice
+    assert out["report"] and '"data"' in out["report"]    # the stdout report is unaffected by the live cap
+
+
 def test_run_job_cancelled_by_server_kills_and_flags():
     """When the server puts a running job's id in CANCEL (scan deleted/stopped), run_job kills the subprocess
     promptly, flags the result as cancelled, and does NOT report it as finished — the worker then posts nothing
