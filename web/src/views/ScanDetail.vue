@@ -34,6 +34,7 @@ const selJob = ref(null)                 // the asset the user drilled into
 const findings = ref([]); const fTotal = ref(0); const fOffset = ref(0)
 const fState = ref(''); const fSev = ref(''); const fSort = ref('severity'); const fDir = ref('asc'); const fq = ref('')
 const selFinding = ref(null)
+const detail = ref(null)                 // heavy per-finding data (evidence/reproduce/raw), fetched on expand
 
 let timer = null, es = null
 
@@ -69,7 +70,11 @@ function setSort(col) {
   fOffset.value = 0; loadFindings()
 }
 function sortInd(col) { return fSort.value === col ? (fDir.value === 'asc' ? ' ▲' : ' ▼') : '' }
-function toggleFinding(f) { selFinding.value = selFinding.value === f.id ? null : f.id }
+async function toggleFinding(f) {
+  if (selFinding.value === f.id) { selFinding.value = null; detail.value = null; return }
+  selFinding.value = f.id; detail.value = null
+  try { detail.value = await api.get(`/scans/${id}/findings/${f.id}`) } catch (e) { /* transient */ }
+}
 async function exportFindings(fmt) {
   let u = `${apiBase()}/scans/${id}/findings/export?format=${fmt}&state=${fState.value}&sort=${fSort.value}&dir=${fDir.value}`
   if (fSev.value) u += `&severity=${fSev.value}`
@@ -85,10 +90,14 @@ async function exportFindings(fmt) {
 async function loadScan() { scan.value = await api.get('/scans/' + id) }
 async function loadJobs() { const r = await api.get(jobsUrl()); jobs.value = r.items; jobsTotal.value = r.total; jobCounts.value = r.counts }
 async function loadFindings() { const r = await api.get(findingsUrl()); findings.value = r.items; fTotal.value = r.total }
+const isLive = () => scan.value && !['done', 'stopped'].includes(scan.value.status)
+function stopLive() { if (timer) { clearInterval(timer); timer = null } if (es) { es.close(); es = null } }
+function ensureLive() { if (!timer) timer = setInterval(refresh, 2500); if (!es) startStream() }
 async function refresh() {
   try {
     await Promise.all([loadScan(), loadJobs(), loadFindings()])
     if (!es) { const ev = await api.get('/scans/' + id + '/events?since=' + cursor.value); if (ev.length) pushEvents(ev) }
+    if (!isLive()) stopLive()      // a finished scan is static — stop polling + close the stream
   } catch (e) { /* transient */ }
 }
 function pushEvents(list) {
@@ -107,7 +116,10 @@ function startStream() {
     es.onerror = () => { if (es) { es.close(); es = null } }
   } catch { es = null }
 }
-async function act(a) { try { await api.post('/scans/' + id + '/' + a); await refresh() } catch (e) { alert(e.message) } }
+async function act(a) {
+  try { await api.post('/scans/' + id + '/' + a); await refresh(); if (isLive()) ensureLive() }  // rerun/resume -> live again
+  catch (e) { alert(e.message) }
+}
 async function downloadReport() {
   try {
     const r = await fetch(`${apiBase()}/scans/${id}/report`, { headers: { Authorization: 'Bearer ' + token() } })
@@ -125,10 +137,10 @@ function applyFindingFilters() { fOffset.value = 0; loadFindings() }
 onMounted(async () => {
   // load the tables WITHOUT events (refresh() would also poll events and race the seed below → duplicates)
   await Promise.all([loadScan(), loadJobs(), loadFindings()]).catch(() => {})
-  const seed = await api.get('/scans/' + id + '/events?since=0').catch(() => [])
+  // seed only the MOST RECENT events (not the whole history) so opening a big scan doesn't replay thousands
+  const seed = await api.get('/scans/' + id + '/events?tail=200').catch(() => [])
   if (seed.length) pushEvents(seed)
-  startStream()
-  timer = setInterval(refresh, 2500)
+  if (isLive()) ensureLive()       // only a running/paused scan needs the live stream + polling
 })
 onUnmounted(() => { clearInterval(timer); if (es) es.close() })
 </script>
@@ -242,12 +254,13 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
                 <div><span class="k">First seen</span>{{ f.first_seen }}</div>
                 <div><span class="k">Last seen</span>{{ f.last_seen }}</div>
               </div>
-              <template v-if="f.evidence"><b style="font-size:13px">Evidence</b><div class="log" style="max-height:200px">{{ f.evidence }}</div></template>
-              <template v-if="f.reproduce"><b style="font-size:13px">Reproduce</b><div class="log" style="max-height:160px">{{ f.reproduce }}</div></template>
-              <template v-if="Object.keys(f.raw || {}).length">
+              <template v-if="detail && detail.evidence"><b style="font-size:13px">Evidence</b><div class="log" style="max-height:200px">{{ detail.evidence }}</div></template>
+              <template v-if="detail && detail.reproduce"><b style="font-size:13px">Reproduce</b><div class="log" style="max-height:160px">{{ detail.reproduce }}</div></template>
+              <template v-if="detail && Object.keys(detail.raw || {}).length">
                 <b style="font-size:13px">Full report (from boxcutter)</b>
-                <div class="log" style="max-height:260px">{{ JSON.stringify(f.raw, null, 2) }}</div>
+                <div class="log" style="max-height:260px">{{ JSON.stringify(detail.raw, null, 2) }}</div>
               </template>
+              <div v-if="!detail" class="muted" style="font-size:12px">Loading detail…</div>
             </td>
           </tr>
         </template>

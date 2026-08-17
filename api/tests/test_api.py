@@ -578,7 +578,26 @@ def test_findings_sort_by_column_and_raw_detail(client):
     desc = client.get(f"/scans/{sid}/findings?sort=title&dir=desc", headers=h).json()["items"]
     assert [x["title"] for x in desc] == ["Zebra", "Alpha"]
     alpha = next(x for x in asc if x["title"] == "Alpha")
-    assert alpha["raw"].get("evidence") == "E2" and alpha["cls"] == "c"    # full boxcutter item preserved
+    assert alpha["cls"] == "c" and "evidence" not in alpha    # LIST is light — no evidence/raw
+    # the heavy detail (evidence + full raw report) is fetched on demand per finding
+    det = client.get(f"/scans/{sid}/findings/{alpha['id']}", headers=h).json()
+    assert det["evidence"] == "E2" and det["raw"].get("evidence") == "E2"
+
+
+def test_events_tail_returns_most_recent(client):
+    """?tail=N returns only the most RECENT N events (oldest-first), so opening a scan with a big backlog seeds
+    a small recent window instead of replaying the whole history."""
+    h = auth(login(client))
+    tid = _tool_template(client, h, name="tail-t")
+    sid = client.post("/scans", json={"name": "tail", "template_id": tid, "targets": ["example.com"],
+                                      "authorized": True}, headers=h).json()["id"]
+    r = FakeRunner(client, name="tail-runner")
+    job = r.claim()["job"]
+    for i in range(10):
+        r.emit(job["id"], f"line {i}")
+    assert len(client.get(f"/scans/{sid}/events?since=0", headers=h).json()) >= 10
+    tail = client.get(f"/scans/{sid}/events?tail=3", headers=h).json()
+    assert [e["line"] for e in tail] == ["line 7", "line 8", "line 9"]     # newest 3, oldest-first
 
 
 def test_findings_export_csv_json(client):

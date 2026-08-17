@@ -249,16 +249,12 @@ def scan_findings(scan_id: int, state: str | None = None, severity: str | None =
     total = session.exec(select(func.count()).select_from(Finding).where(*conds)).one()
     rows = session.exec(select(Finding).where(*conds).order_by(_finding_order(sort, dir), Finding.id.desc())
                         .offset(offset).limit(limit)).all()
-    items = []
-    for f in rows:
-        try:
-            raw = json.loads(f.raw_json) if f.raw_json else {}
-        except Exception:  # noqa: BLE001
-            raw = {}
-        items.append({"id": f.id, "target": f.target, "severity": f.severity, "title": f.title, "url": f.url,
-                      "cls": f.cls, "evidence": f.evidence, "reproduce": f.reproduce, "state": f.state,
-                      "fingerprint": f.fingerprint, "template_kind": f.template_kind,
-                      "first_seen": f.first_seen, "last_seen": f.last_seen, "raw": raw})
+    # LIST is intentionally light — no evidence/reproduce/raw (those can be many KB each). The table only shows
+    # them when a row is expanded, so the UI fetches the detail then (GET .../findings/{id}). This keeps the
+    # list small and cheap to poll for a live scan.
+    items = [{"id": f.id, "target": f.target, "severity": f.severity, "title": f.title, "url": f.url,
+              "cls": f.cls, "state": f.state, "fingerprint": f.fingerprint, "template_kind": f.template_kind,
+              "first_seen": f.first_seen, "last_seen": f.last_seen} for f in rows]
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
@@ -288,6 +284,25 @@ def findings_export(scan_id: int, format: str = "csv", state: str | None = None,
         w.writerow([getattr(f, c) for c in _EXPORT_COLS])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="scan-{scan_id}-findings.csv"'})
+
+
+@router.get("/{scan_id}/findings/{finding_id}")
+def scan_finding_detail(scan_id: int, finding_id: int, user: User = Depends(current_user),
+                        session: Session = Depends(get_session)):
+    """The heavy per-finding detail (evidence, reproduce, full raw report) — fetched on demand when a finding
+    row is expanded, so the findings LIST stays light. (Defined after /export so that literal route wins.)"""
+    scan = session.get(Scan, scan_id)
+    if not scan or not _perm(session, scan, user):
+        raise HTTPException(404)
+    f = session.get(Finding, finding_id)
+    if not f or f.scan_id != scan_id:
+        raise HTTPException(404)
+    try:
+        raw = json.loads(f.raw_json) if f.raw_json else {}
+    except Exception:  # noqa: BLE001
+        raw = {}
+    return {"id": f.id, "evidence": f.evidence, "reproduce": f.reproduce, "raw": raw, "cls": f.cls,
+            "template_kind": f.template_kind, "url": f.url, "first_seen": f.first_seen, "last_seen": f.last_seen}
 
 
 _SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
@@ -386,13 +401,21 @@ def scan_jobs(scan_id: int, status: str | None = None, q: str | None = None, run
 
 
 @router.get("/{scan_id}/events")
-def scan_events(scan_id: int, since: int = 0, user: User = Depends(current_user),
+def scan_events(scan_id: int, since: int = 0, tail: int = 0, user: User = Depends(current_user),
                 session: Session = Depends(get_session)):
+    """Live-log events. `since` streams forward from a cursor (the poll fallback). `tail=N` returns only the
+    most RECENT N events — the page seeds with this so opening a scan with a huge backlog doesn't replay the
+    whole history (it then streams only new events from the newest id)."""
     scan = session.get(Scan, scan_id)
     if not scan or not _perm(session, scan, user):
         raise HTTPException(404)
-    rows = session.exec(select(JobEvent).where(
-        JobEvent.scan_id == scan_id, JobEvent.id > since).order_by(JobEvent.id).limit(500)).all()
+    if tail and tail > 0:
+        rows = session.exec(select(JobEvent).where(JobEvent.scan_id == scan_id)
+                            .order_by(JobEvent.id.desc()).limit(min(tail, 1000))).all()
+        rows = list(reversed(rows))                  # newest N, returned oldest-first for display
+    else:
+        rows = session.exec(select(JobEvent).where(
+            JobEvent.scan_id == scan_id, JobEvent.id > since).order_by(JobEvent.id).limit(500)).all()
     return [{"cursor": e.id, "job_id": e.job_id, "phase": e.phase, "agent": e.agent,
              "line": e.line, "reasoning": e.reasoning, "at": e.at} for e in rows]
 
