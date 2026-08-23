@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy import func, update
 from sqlmodel import Session, select
 
-from .models import Finding
+from .models import Finding, ScanItem
 
 # Informational reconnaissance / reachability items (e.g. "host reachable") are not issues and must not render
 # as findings.
@@ -30,6 +30,47 @@ def is_issue(f: dict) -> bool:
     cls = str(f.get("cls", "")).strip().lower()
     if sev in ("", "info", "informational", "none") and cls in _RECON_CLS:
         return False
+    return True
+
+
+# Keys an engine may use for a plain listable result, best first. A workflow that enumerates URLs/hosts
+# returns these instead of findings, and they must not be thrown away just because they aren't issues.
+_ITEM_KEYS = ("url", "value", "item", "endpoint", "location", "host", "domain", "ip", "path", "name")
+
+
+def item_value(entry) -> str:
+    """The listable value in an envelope entry that is not a finding. Bare strings count — a tool may simply
+    return a list of URLs — and dicts give up their first item-ish key. Empty means there is nothing to list."""
+    if isinstance(entry, (str, int)):
+        return str(entry).strip()[:2048]
+    if isinstance(entry, dict):
+        for k in _ITEM_KEYS:
+            v = entry.get(k)
+            if isinstance(v, (str, int)) and str(v).strip():
+                return str(v).strip()[:2048]
+    return ""
+
+
+def item_fingerprint(target: str, value: str) -> str:
+    return hashlib.sha256("|".join([target or "", normalize_url(value) or value]).encode()).hexdigest()
+
+
+def upsert_item(session: Session, scan_id: int, kind: str, target: str, value: str,
+                label: str = "", cls: str = "", run_no: int = 0) -> bool:
+    """Insert a non-finding item, or bump `last_seen` if this scan already has it (so a rerun refreshes rather
+    than duplicates). Returns True when the row is new."""
+    fp = item_fingerprint(target, value)
+    row = session.exec(select(ScanItem).where(ScanItem.scan_id == scan_id,
+                                              ScanItem.fingerprint == fp)).first()
+    at = datetime.now(timezone.utc)
+    if row is not None:
+        row.last_seen, row.run_no = at, run_no
+        session.add(row)
+        return False
+    row = ScanItem(scan_id=scan_id, target=target, template_kind=kind, fingerprint=fp,
+                   value=value[:2048], label=(label or "")[:400], run_no=run_no, first_seen=at, last_seen=at)
+    row.cls = (cls or "")[:120]      # 'cls' can't be a constructor kwarg (shadows __new__), same as Finding
+    session.add(row)
     return True
 
 

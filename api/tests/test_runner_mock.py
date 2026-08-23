@@ -74,13 +74,34 @@ def test_run_job_hard_cap_kills_chatty_runaway():
     assert out["error"] and "runtime" in out["error"]
 
 
-def test_idle_timeout_off_by_default_but_max_runtime_still_bounds_silent_jobs():
-    """The idle timeout is OFF by default (0) so a long SILENT step (sqlmap/ZAP) isn't falsely killed — but the
-    absolute JOB_MAX_RUNTIME still bounds a silent job so it can't hang a slot forever."""
+def test_no_idle_kill_and_a_6h_backstop():
+    """A boxcutter scan runs for as long as it needs to: no idle kill, so a long SILENT step (sqlmap /
+    full-ZAP / an AI agent thinking) is never cut short — bounded only by the 6h absolute backstop that keeps
+    a wedged engine from holding a worker slot forever."""
     import sys
     import time as _t
     sup = _load_supervisor()
-    assert sup.JOB_IDLE_TIMEOUT == 0                  # default: no idle kill
+    assert sup.JOB_IDLE_TIMEOUT == 0                  # no idle kill
+    assert sup.JOB_MAX_RUNTIME == 6 * 3600            # absolute backstop only
+    assert sup.JOB_TIMEOUT == 0                       # no legacy hard cap shadowing it
+    sup._req = lambda *a, **k: {}
+    sup._emit = lambda *a, **k: None
+    sup.MOCK = False
+    sup.BOXCUTTER_CMD = [sys.executable, "-c",        # silent well past the old 2s-poll window, then finishes
+                         "import time; time.sleep(4); print('{\"success\": true, \"data\": []}')"]
+    t0 = _t.time()
+    out = sup.run_job({"id": 1, "argv": [], "target": "x"}, {})
+    assert _t.time() - t0 >= 4                        # ran to completion, not cut short
+    assert out["error"] is None
+    assert out["envelope"]["success"] is True
+
+
+def test_max_runtime_still_bounds_a_job_when_you_opt_in():
+    """The absolute cap is opt-in, but when an operator does set JOB_MAX_RUNTIME it must still bound a silent
+    job so a wedged engine can't hold a worker slot forever."""
+    import sys
+    import time as _t
+    sup = _load_supervisor()
     sup._req = lambda *a, **k: {}
     sup._emit = lambda *a, **k: None
     sup.MOCK = False

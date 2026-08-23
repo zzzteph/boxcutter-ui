@@ -17,7 +17,7 @@ from sqlmodel import Session, select
 from ..activity import log_activity
 from ..config import settings
 from ..db import get_session
-from ..diff import is_issue, reconcile_run, upsert_finding
+from ..diff import is_issue, item_value, reconcile_run, upsert_finding, upsert_item
 from ..notify import notify, notify_findings
 from ..models import (Activity, EnrollToken, Finding, Job, JobEvent, LLMProfile, NotifySettings, Runner, Scan,
                       Target, Template, User)
@@ -231,7 +231,7 @@ def job_result(job_id: int, body: ResultIn, runner: Runner = Depends(current_run
     new_crits: list[str] = []
     new_findings: list[dict] = []
     for f in (body.envelope or {}).get("data") or []:
-        if isinstance(f, dict) and is_issue(f):        # skip recon/reachability noise (e.g. "host reachable")
+        if isinstance(f, dict) and is_issue(f):
             _, created = upsert_finding(session, job.scan_id, kind, target.value, f, run_no=job.run_no)
             if created:
                 sev = str(f.get("severity", "info")).title()
@@ -239,6 +239,15 @@ def job_result(job_id: int, body: ResultIn, runner: Runner = Depends(current_run
                                      "url": str(f.get("url", "")), "target": target.value})
                 if sev == "Critical":
                     new_crits.append(str(f.get("title", ""))[:200])
+            continue
+        # Not an issue: a URL/host/endpoint the workflow enumerated, or a bare string in the data list. These
+        # used to be dropped — they are kept as scan items so they can be listed and downloaded one per line.
+        value = item_value(f)
+        if value:
+            upsert_item(session, job.scan_id, kind, target.value, value,
+                        label=str(f.get("title", ""))[:400] if isinstance(f, dict) else "",
+                        cls=str(f.get("cls", ""))[:120] if isinstance(f, dict) else "",
+                        run_no=job.run_no)
     if body.error:                                # retry a failed job up to the cap, else mark it failed
         job.status = "pending" if job.attempts < settings.job_max_attempts else "failed"
         job.runner_id = None if job.status == "pending" else job.runner_id

@@ -47,14 +47,15 @@ ENGINE_PROBE_TRIES = 3                 # then give up: an engine that isn't ther
 # envelope. Lets `docker compose up` / a local supervisor demonstrate claim->event->result->diff offline
 # (and never scans a real target). See BUILD.md testing notes.
 MOCK = os.environ.get("MOCK_RUNNER", "").strip().lower() not in ("", "0", "false", "no")
-# A deep scan can legitimately run a long time while SILENT — a single sqlmap / full-ZAP / nuclei step produces
-# no output for a while, and --steps only prints at step boundaries. So an idle timeout easily kills real work.
-# By default we therefore DON'T idle-kill (JOB_IDLE_TIMEOUT=0); JOB_MAX_RUNTIME is the only bound — a generous
-# backstop so a truly wedged job can't hold a slot forever. Set JOB_IDLE_TIMEOUT>0 to re-enable silence
-# detection. While the engine is quiet we emit a periodic "still running" keepalive so a live job never looks
-# dead, and whatever it printed is captured/returned even if it is killed.
+# A boxcutter scan runs for as long as it needs to. There is NO idle timeout: a deep scan (AI agent, full
+# workflow, sqlmap/ZAP/nuclei) is SILENT for long stretches — --steps only prints at step boundaries — so a
+# silence clock kills real work. The ONLY bound is a 6h absolute backstop; it exists so a wedged engine can't
+# hold a worker slot forever. Raise JOB_MAX_RUNTIME if you run scans that legitimately go longer. Normally a
+# job ends when the engine exits, when the server cancels it (scan stopped/deleted), or when the operator stops
+# it. While the engine is quiet we emit a periodic "still running" keepalive so a live job never looks dead,
+# and whatever it printed is captured/returned even if it is killed.
 JOB_IDLE_TIMEOUT = int(os.environ.get("JOB_IDLE_TIMEOUT", "0") or 0)         # kill if silent N seconds (0 = off)
-JOB_MAX_RUNTIME = int(os.environ.get("JOB_MAX_RUNTIME", "21600") or 0)       # absolute cap (s); 0 = unlimited
+JOB_MAX_RUNTIME = int(os.environ.get("JOB_MAX_RUNTIME", "21600") or 0)       # absolute cap: 6h (0 = unlimited)
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "0") or 0)                   # legacy hard cap; 0 = use the above
 # Flood guard: stop STREAMING live-log lines for a job past this many (a --debug tool can spew thousands) so we
 # don't hammer the server or balloon its log table. The raw report (Raw output) still keeps everything, and the
@@ -336,10 +337,11 @@ def engine_version() -> str:
 
 def run_job(job: dict, secrets: dict) -> dict:
     """Run `boxcutter <argv>`, streaming stderr as live steps and capturing stdout as the findings envelope /
-    raw report. A deep scan (AI agent, big workflow) can legitimately run for hours, so instead of a hard
-    total-runtime cap we kill the job only when it goes SILENT for JOB_IDLE_TIMEOUT (a hung engine), with
-    JOB_MAX_RUNTIME as a runaway backstop. Whatever the job printed is ALWAYS captured and returned — even when
-    killed — so you can always see its output; and the whole process tree is reaped so it can't wedge a slot."""
+    raw report. No idle timeout — a deep scan is legitimately silent for long stretches — and the only bound is
+    the 6h JOB_MAX_RUNTIME backstop, so a wedged engine can't hold a slot forever. Whatever the job printed is
+    ALWAYS captured
+    and returned — even when killed — so you can always see its output; and the whole process tree is reaped so
+    it can't wedge a slot."""
     if MOCK:
         return _mock_run(job)
     env = dict(os.environ)

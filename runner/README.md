@@ -37,6 +37,10 @@ Env (or the local UI, which persists to `$RUNNER_CONFIG`):
 - `CONCURRENCY` — number of parallel boxcutter jobs (changeable live from the UI).
 - `BOXCUTTER_CMD` — how to invoke the engine (default `boxcutter`).
 - `BOXCUTTER_VERSION` — pin the engine version shown on the Scanners page instead of probing for it.
+- `JOB_IDLE_TIMEOUT` — kill a job after N seconds of silence. **0 (off)** by default; a deep scan is legitimately
+  quiet for long stretches, so a silence clock kills real work.
+- `JOB_MAX_RUNTIME` — absolute backstop, seconds. **21600 (6h)** by default, so a wedged engine can't hold a
+  worker slot forever. Raise it if your scans legitimately run longer; `0` disables it entirely.
 - `RUNNER_UI_PORT` — local control UI port (default 7070).
 
 ## Notes

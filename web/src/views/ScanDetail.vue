@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, apiBase, token } from '../api'
-import { durationLabel, fmtDuration } from '../util'
+import { durationLabel, fmtDuration, timeAgo } from '../util'
 import Select from '../components/Select.vue'
 
 const route = useRoute()
@@ -13,7 +13,7 @@ async function delScan() {
   if (!confirm(`Delete scan "${scan.value ? scan.value.name : ''}" and all its findings? This can't be undone.`)) return
   try { await api.del('/scans/' + id); router.push('/scans') } catch (e) { alert(e.message) }
 }
-const JLIMIT = 25, FLIMIT = 25
+const JLIMIT = 25, FLIMIT = 25, ILIMIT = 100
 const SEVS = ['Critical', 'High', 'Medium', 'Low', 'Info']
 const sevOpts = [{ value: '', label: 'All severities' }, ...SEVS.map(s => ({ value: s, label: s }))]
 const jobStatusOpts = [{ value: '', label: 'All statuses' },
@@ -35,6 +35,12 @@ const findings = ref([]); const fTotal = ref(0); const fOffset = ref(0)
 const fState = ref(''); const fSev = ref(''); const fSort = ref('severity'); const fDir = ref('asc'); const fq = ref('')
 const selFinding = ref(null)
 const detail = ref(null)                 // heavy per-finding data (evidence/reproduce/raw), fetched on expand
+
+// items — the non-finding results (a recon workflow's domains, a crawl's URLs). The panel only exists for a
+// scan that actually produced some, so an ordinary vuln scan looks exactly as it did before.
+const items = ref([]); const iTotal = ref(0); const iOffset = ref(0)
+const iq = ref(''); const iSort = ref('value'); const iDir = ref('asc')
+const hasItems = () => !!(scan.value && scan.value.items_total > 0)
 
 let timer = null, es = null
 
@@ -64,6 +70,32 @@ function findingsUrl() {
   if (selJob.value) u += `&target=${encodeURIComponent(selJob.value.target)}`
   return u
 }
+function itemsUrl() {
+  let u = `/scans/${id}/items?limit=${ILIMIT}&offset=${iOffset.value}&sort=${iSort.value}&dir=${iDir.value}`
+  if (iq.value) u += `&q=${encodeURIComponent(iq.value)}`
+  if (selJob.value) u += `&target=${encodeURIComponent(selJob.value.target)}`
+  return u
+}
+function setISort(col) {
+  if (iSort.value === col) iDir.value = iDir.value === 'asc' ? 'desc' : 'asc'
+  else { iSort.value = col; iDir.value = col === 'last_seen' ? 'desc' : 'asc' }
+  iOffset.value = 0; loadItems()
+}
+function iSortInd(col) { return iSort.value === col ? (iDir.value === 'asc' ? ' \u25b2' : ' \u25bc') : '' }
+function iPage(d) { iOffset.value = Math.max(0, iOffset.value + d * ILIMIT); loadItems() }
+function applyItemFilters() { iOffset.value = 0; loadItems() }
+async function exportItems() {
+  // one entry per line, ready to pipe back into a tool — same filters/sort as the list on screen
+  let u = `${apiBase()}/scans/${id}/items/export?sort=${iSort.value}&dir=${iDir.value}`
+  if (iq.value) u += `&q=${encodeURIComponent(iq.value)}`
+  if (selJob.value) u += `&target=${encodeURIComponent(selJob.value.target)}`
+  try {
+    const r = await fetch(u, { headers: { Authorization: 'Bearer ' + token() } })
+    if (!r.ok) throw new Error('export failed')
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(await r.blob()); a.download = `scan-${id}-items.txt`; a.click(); URL.revokeObjectURL(a.href)
+  } catch (e) { alert(e.message) }
+}
 function setSort(col) {
   if (fSort.value === col) fDir.value = fDir.value === 'asc' ? 'desc' : 'asc'
   else { fSort.value = col; fDir.value = col === 'last_seen' ? 'desc' : 'asc' }
@@ -90,12 +122,14 @@ async function exportFindings(fmt) {
 async function loadScan() { scan.value = await api.get('/scans/' + id) }
 async function loadJobs() { const r = await api.get(jobsUrl()); jobs.value = r.items; jobsTotal.value = r.total; jobCounts.value = r.counts }
 async function loadFindings() { const r = await api.get(findingsUrl()); findings.value = r.items; fTotal.value = r.total }
+async function loadItems() { const r = await api.get(itemsUrl()); items.value = r.items; iTotal.value = r.total }
 const isLive = () => scan.value && !['done', 'stopped'].includes(scan.value.status)
 function stopLive() { if (timer) { clearInterval(timer); timer = null } if (es) { es.close(); es = null } }
 function ensureLive() { if (!timer) timer = setInterval(refresh, 2500); if (!es) startStream() }
 async function refresh() {
   try {
     await Promise.all([loadScan(), loadJobs(), loadFindings()])
+    if (hasItems()) await loadItems()          // only once the scan has actually produced some
     if (!es) { const ev = await api.get('/scans/' + id + '/events?since=' + cursor.value); if (ev.length) pushEvents(ev) }
     if (!isLive()) stopLive()      // a finished scan is static — stop polling + close the stream
   } catch (e) { /* transient */ }
@@ -129,7 +163,11 @@ async function downloadReport() {
     a.download = `scan-${id}-report.md`; a.click(); URL.revokeObjectURL(a.href)
   } catch (e) { alert(e.message) }
 }
-function selectAsset(j) { selJob.value = (selJob.value && selJob.value.id === j.id) ? null : j; fOffset.value = 0; loadFindings() }
+function selectAsset(j) {
+  selJob.value = (selJob.value && selJob.value.id === j.id) ? null : j
+  fOffset.value = 0; loadFindings()
+  iOffset.value = 0; if (hasItems()) loadItems()
+}
 function jobPage(d) { jobOffset.value = Math.max(0, jobOffset.value + d * JLIMIT); loadJobs() }
 function fPage(d) { fOffset.value = Math.max(0, fOffset.value + d * FLIMIT); loadFindings() }
 function applyFindingFilters() { fOffset.value = 0; loadFindings() }
@@ -137,6 +175,7 @@ function applyFindingFilters() { fOffset.value = 0; loadFindings() }
 onMounted(async () => {
   // load the tables WITHOUT events (refresh() would also poll events and race the seed below → duplicates)
   await Promise.all([loadScan(), loadJobs(), loadFindings()]).catch(() => {})
+  if (hasItems()) await loadItems().catch(() => {})
   // seed only the MOST RECENT events (not the whole history) so opening a big scan doesn't replay thousands
   const seed = await api.get('/scans/' + id + '/events?tail=200').catch(() => [])
   if (seed.length) pushEvents(seed)
@@ -232,6 +271,7 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
         <th class="sortable" @click="setSort('target')">Asset{{ sortInd('target') }}</th>
         <th>URL</th>
         <th class="sortable" @click="setSort('state')">State{{ sortInd('state') }}</th>
+        <th class="sortable" @click="setSort('last_seen')">Seen{{ sortInd('last_seen') }}</th>
       </tr></thead>
       <tbody>
         <template v-for="f in findings" :key="f.id">
@@ -241,9 +281,10 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
             <td data-label="Asset">{{ f.target }}</td>
             <td data-label="URL" style="word-break:break-all">{{ f.url }}</td>
             <td data-label="State"><span class="state" :class="'state-' + f.state">{{ f.state }}</span></td>
+            <td data-label="Seen" class="muted" style="white-space:nowrap" :title="f.last_seen">{{ timeAgo(f.last_seen) }}</td>
           </tr>
           <tr v-if="selFinding === f.id" class="expand">
-            <td colspan="5">
+            <td colspan="6">
               <div class="detail">
                 <div><span class="k">Severity</span><span class="badge" :class="'sev-' + f.severity">{{ f.severity }}</span></div>
                 <div><span class="k">State</span>{{ f.state }}</div>
@@ -264,7 +305,7 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
             </td>
           </tr>
         </template>
-        <tr v-if="!findings.length"><td colspan="5" class="muted">No findings match.</td></tr>
+        <tr v-if="!findings.length"><td colspan="6" class="muted">No findings match.</td></tr>
       </tbody>
     </table>
     </div>
@@ -273,6 +314,48 @@ onUnmounted(() => { clearInterval(timer); if (es) es.close() })
       <span class="muted">{{ fOffset + 1 }}–{{ Math.min(fOffset + FLIMIT, fTotal) }} of {{ fTotal }}</span>
       <button class="ghost" :disabled="fOffset + FLIMIT >= fTotal" @click="fPage(1)">Next →</button>
     </div>
+
+    <!-- items: results that aren't findings (recon domains, crawled URLs) — only for scans that made some -->
+    <template v-if="hasItems()">
+      <div class="row" style="justify-content:space-between;align-items:flex-end;margin-top:20px;gap:8px">
+        <h2 style="margin:0">Items <span class="muted" style="font-weight:400">({{ iTotal }})</span>
+          <span v-if="selJob" class="chip">{{ selJob.target }} <a @click.prevent="selectAsset(selJob)" href="#">\u2715</a></span>
+        </h2>
+        <div class="row" style="gap:8px">
+          <input v-model="iq" placeholder="search\u2026" style="width:auto;max-width:150px" @keyup.enter="applyItemFilters" @input="applyItemFilters" />
+          <button class="ghost" title="Download as a .txt file, one entry per line" @click="exportItems">\u2b07 TXT</button>
+        </div>
+      </div>
+      <div class="muted" style="font-size:12px;margin-bottom:4px">
+        Results this scan produced that aren't findings \u2014 domains, hosts, URLs. TXT gives you one per line.
+      </div>
+      <div class="card tablecard">
+        <table class="reflow rows">
+          <thead><tr>
+            <th class="sortable" @click="setISort('value')">Value{{ iSortInd('value') }}</th>
+            <th class="sortable" @click="setISort('target')">Asset{{ iSortInd('target') }}</th>
+            <th class="sortable" @click="setISort('last_seen')">Seen{{ iSortInd('last_seen') }}</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="it in items" :key="it.id">
+              <td data-label="Value" style="word-break:break-all">
+                <a v-if="/^https?:\/\//.test(it.value)" :href="it.value" target="_blank" rel="noopener">{{ it.value }}</a>
+                <code v-else>{{ it.value }}</code>
+                <span v-if="it.label && it.label !== it.value" class="muted" style="font-size:12px"> \u00b7 {{ it.label }}</span>
+              </td>
+              <td data-label="Asset">{{ it.target }}</td>
+              <td data-label="Seen" class="muted" style="white-space:nowrap" :title="it.last_seen">{{ timeAgo(it.last_seen) }}</td>
+            </tr>
+            <tr v-if="!items.length"><td colspan="3" class="muted">No items match.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-if="iTotal > ILIMIT" class="row pager">
+        <button class="ghost" :disabled="iOffset === 0" @click="iPage(-1)">\u2190 Prev</button>
+        <span class="muted">{{ iOffset + 1 }}\u2013{{ Math.min(iOffset + ILIMIT, iTotal) }} of {{ iTotal }}</span>
+        <button class="ghost" :disabled="iOffset + ILIMIT >= iTotal" @click="iPage(1)">Next \u2192</button>
+      </div>
+    </template>
 
     <h2 style="margin-top:20px">Live log</h2>
     <div class="log">{{ logText || 'waiting for output…' }}</div>

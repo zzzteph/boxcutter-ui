@@ -934,3 +934,95 @@ def test_engine_version_is_reported_per_scanner(client):
     client.post("/runner/heartbeat", json={"status": "idle", "slots": 1, "version": "0.1.0"}, headers=rh)
     assert row()["engine_version"] == "2.4.0"        # a beat that hasn't probed yet must not erase it
     assert client.get(f"/runners/{rid}", headers=h).json()["engine_version"] == "2.4.0"
+
+
+# ---- items: results that aren't findings (a recon workflow's domain list, a crawl's URLs) -------------------
+def _recon_scan(client, h, data):
+    """Run one job whose envelope carries `data` and return the scan id."""
+    r = client.post("/templates", json={"name": "recon", "kind": "workflow",
+                                        "spec": {"name": "recon"}}, headers=h)
+    tid = r.json()["id"]
+    r = client.post("/scans", json={"name": "recon run", "template_id": tid,
+                                    "targets": ["example.com"], "authorized": True}, headers=h)
+    scan_id = r.json()["id"]
+    runner = FakeRunner(client)
+    job = runner.claim()["job"]
+    runner.result(job["id"], data)
+    return scan_id
+
+
+def test_recon_domains_are_kept_as_items_not_dropped(client):
+    """A recon workflow returns a list of domains, not findings. Those used to be dropped on the floor; they
+    are kept as scan items so they can be listed and downloaded."""
+    h = auth(login(client))
+    scan_id = _recon_scan(client, h, [
+        "sub1.example.com",                                     # a bare string in the data list
+        "sub2.example.com",
+        {"host": "sub3.example.com", "cls": "recon"},           # a dict with no finding-ish content
+        {"url": "http://example.com", "title": "example.com reachable", "cls": "recon", "severity": "info"},
+        {"title": "Missing security headers", "severity": "Medium", "cls": "headers",   # a REAL finding
+         "url": "http://example.com"},
+    ])
+
+    r = client.get(f"/scans/{scan_id}/items", headers=h).json()
+    values = [i["value"] for i in r["items"]]
+    assert r["total"] == 4
+    assert values == ["http://example.com", "sub1.example.com", "sub2.example.com", "sub3.example.com"]
+
+    # the real finding still went to findings, and is NOT duplicated into items
+    f = client.get(f"/scans/{scan_id}/findings", headers=h).json()
+    assert [x["title"] for x in f["items"]] == ["Missing security headers"]
+    assert client.get(f"/scans/{scan_id}", headers=h).json()["items_total"] == 4
+
+
+def test_items_download_is_one_entry_per_line(client):
+    """The .txt download is the format you can pipe straight back into a tool: one entry per line, nothing
+    else — no header, no quoting."""
+    h = auth(login(client))
+    scan_id = _recon_scan(client, h, ["b.example.com", "a.example.com", "c.example.com"])
+
+    r = client.get(f"/scans/{scan_id}/items/export", headers=h)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert f'filename="scan-{scan_id}-items.txt"' in r.headers["content-disposition"]
+    assert r.text == "a.example.com\nb.example.com\nc.example.com\n"
+
+    # the download honours the search filter shown on screen
+    assert client.get(f"/scans/{scan_id}/items/export?q=b.ex", headers=h).text == "b.example.com\n"
+
+
+def test_items_are_deduped_across_reruns(client):
+    """A rerun re-emits the same domains — they refresh in place instead of piling up duplicates."""
+    h = auth(login(client))
+    scan_id = _recon_scan(client, h, ["dup.example.com", "dup.example.com", "other.example.com"])
+    assert client.get(f"/scans/{scan_id}/items", headers=h).json()["total"] == 2
+
+    client.post(f"/scans/{scan_id}/rerun", headers=h)
+    runner = FakeRunner(client)
+    job = runner.claim()["job"]
+    runner.result(job["id"], ["dup.example.com", "new.example.com"])
+    r = client.get(f"/scans/{scan_id}/items", headers=h).json()
+    assert r["total"] == 3
+    assert [i["value"] for i in r["items"]] == ["dup.example.com", "new.example.com", "other.example.com"]
+
+
+def test_findings_sort_by_time(client):
+    """The findings table can be sorted by when a finding was last seen — the column the UI was missing."""
+    h = auth(login(client))
+    scan_id = _recon_scan(client, h, [
+        {"title": "First issue", "severity": "Low", "cls": "headers", "url": "http://example.com/1"},
+        {"title": "Second issue", "severity": "Critical", "cls": "sqli", "url": "http://example.com/2"},
+    ])
+    newest = client.get(f"/scans/{scan_id}/findings?sort=last_seen&dir=desc", headers=h).json()["items"]
+    oldest = client.get(f"/scans/{scan_id}/findings?sort=last_seen&dir=asc", headers=h).json()["items"]
+    assert [f["title"] for f in newest] == [f["title"] for f in reversed(oldest)]
+    assert all(f.get("last_seen") for f in newest)          # the column the table renders
+
+
+def test_deleting_a_scan_takes_its_items_with_it(client):
+    """Items are a child table like findings — a deleted scan must not leave them behind."""
+    h = auth(login(client))
+    scan_id = _recon_scan(client, h, ["gone.example.com"])
+    assert client.get(f"/scans/{scan_id}/items", headers=h).json()["total"] == 1
+    assert client.delete(f"/scans/{scan_id}", headers=h).status_code == 200
+    assert client.get(f"/scans/{scan_id}/items", headers=h).status_code == 404
