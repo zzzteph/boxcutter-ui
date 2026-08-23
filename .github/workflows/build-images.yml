@@ -1,4 +1,8 @@
 name: build-images
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Rebuild {0}{1}', inputs.target, inputs.fresh_rebuild && ' (fresh)' || '')
+      || format('build-images ({0})', github.event_name) }}
 
 # Builds and pushes images to GHCR so you can deploy them straight onto servers (no local build):
 #   ghcr.io/<owner>/boxcutter-server   all-in-one: API + built SPA + one built-in agent — multi-arch amd64+arm64
@@ -6,6 +10,10 @@ name: build-images
 #
 # Runs on pushes to the default branch, on version tags (v1.2.3), on demand, and DAILY. Each build produces a
 # multi-arch manifest, so `docker pull …:latest` picks the right architecture automatically.
+#
+# CLICK-TO-REBUILD: Actions tab -> "build-images" -> "Run workflow". Pick which image to rebuild (both / server
+# / agent) and, optionally, tick "fresh_rebuild" to ignore the layer cache entirely. The normal click already
+# re-pulls the boxcutter base (pull: true), so you get the newest engine without the slower no-cache path.
 #
 # The daily run is what keeps the engine current: both images are FROM ghcr.io/zzzteph/boxcutter:latest, which
 # is updated far more often than this repo, so without a scheduled rebuild a new boxcutter would never reach
@@ -30,6 +38,16 @@ on:
     # ever happens, or just push a commit.
     - cron: '17 4 * * *'
   workflow_dispatch:
+    inputs:
+      target:
+        description: Which image to rebuild
+        type: choice
+        default: both
+        options: [ both, server, agent ]
+      fresh_rebuild:
+        description: Ignore the build cache and rebuild every layer from scratch (slower)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -96,6 +114,12 @@ jobs:
             type=sha,format=short
 
       - name: Build and push
+        # a targeted manual rebuild (target: server|agent) skips the other image; every other
+        # trigger (push/tag/schedule, or target: both) builds both.
+        if: >-
+          ${{ github.event_name != 'workflow_dispatch'
+              || inputs.target == 'both'
+              || matrix.name == format('boxcutter-{0}', inputs.target) }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -107,6 +131,9 @@ jobs:
           # base layer - a rebuild has to actually pick up the newest engine, which is what the Scanners page
           # then reports as each agent's boxcutter version.
           pull: true
+          # "fresh_rebuild" click -> rebuild every layer; otherwise reuse the gha cache (pull:true
+          # already re-resolves the base, so an engine update busts the cache on its own anyway).
+          no-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.fresh_rebuild }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
