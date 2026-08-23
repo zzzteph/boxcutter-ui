@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, isAdmin } from '../api'
 import { timeAgo } from '../util'
@@ -26,6 +26,23 @@ async function mkToken() {
 }
 function open(r) { router.push('/scanners/' + r.id) }
 function meterClass(v) { return v >= 85 ? 'hi' : (v >= 60 ? 'mid' : '') }
+
+// The server has no idea what the newest boxcutter release is — but the fleet does: the highest engine version
+// any scanner reports is the newest one we have actually seen, so anything below it is running an old engine.
+function verKey(v) { return (String(v || '').match(/\d+/g) || []).map(Number) }
+function cmpVer(a, b) {
+  const x = verKey(a), y = verKey(b)
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0)
+    if (d) return d > 0 ? 1 : -1
+  }
+  return 0
+}
+const newestEngine = computed(() => runners.value.map(r => r.engine_version).filter(Boolean)
+  .reduce((best, v) => (!best || cmpVer(v, best) > 0 ? v : best), ''))
+function outdated(r) {
+  return !!(r.engine_version && newestEngine.value && cmpVer(r.engine_version, newestEngine.value) < 0)
+}
 onMounted(async () => { await load(); timer = setInterval(load, 3000) })
 onUnmounted(() => clearInterval(timer))
 </script>
@@ -42,7 +59,7 @@ onUnmounted(() => clearInterval(timer))
 
   <div class="card tablecard">
   <table class="reflow rows">
-    <thead><tr><th></th><th>Scanner</th><th>IP</th><th>Status</th><th>Slots</th><th>CPU</th><th>Memory</th><th>Version</th><th>Last beat</th></tr></thead>
+    <thead><tr><th></th><th>Scanner</th><th>IP</th><th>Status</th><th>Slots</th><th>CPU</th><th>Memory</th><th>Boxcutter</th><th>Agent</th><th>Last beat</th></tr></thead>
     <tbody>
       <tr v-for="r in runners" :key="r.id" @click="open(r)" style="cursor:pointer">
         <td data-label=""><span class="dot" :class="r.status === 'disconnected' ? 'bad' : (r.status === 'busy' ? 'busy' : 'ok')"></span></td>
@@ -74,7 +91,12 @@ onUnmounted(() => clearInterval(timer))
           </template>
           <span v-else class="muted">—</span>
         </td>
-        <td data-label="Version">v{{ r.version || '?' }}</td>
+        <td data-label="Boxcutter">
+          <code>{{ r.engine_version || '—' }}</code>
+          <span v-if="outdated(r)" class="tag sm" :title="'Newest engine in the fleet: ' + newestEngine"
+                style="color:var(--warn);background:rgba(253,176,34,.16);margin-left:6px">old</span>
+        </td>
+        <td data-label="Agent" class="muted">v{{ r.version || '?' }}</td>
         <td data-label="Last beat">
           <div class="row" style="gap:8px;align-items:center;flex-wrap:nowrap;justify-content:space-between">
             <span>{{ timeAgo(r.last_heartbeat) }}</span>
@@ -82,7 +104,7 @@ onUnmounted(() => clearInterval(timer))
           </div>
         </td>
       </tr>
-      <tr v-if="!runners.length"><td colspan="9" class="muted">No scanners connected. Start one and enroll it with a token.</td></tr>
+      <tr v-if="!runners.length"><td colspan="10" class="muted">No scanners connected. Start one and enroll it with a token.</td></tr>
     </tbody>
   </table>
   </div>

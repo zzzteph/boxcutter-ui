@@ -1,7 +1,11 @@
 # Single Dockerfile for the whole project. Two images come out of it via build targets (same context "."):
 #
-#   docker build --target server -t boxcutter-server .   # all-in-one: API + built SPA + one built-in agent
-#   docker build --target agent  -t boxcutter-agent  .   # scanner = boxcutter image + supervisor (scale out)
+#   docker build --pull --target server -t boxcutter-server .   # all-in-one: API + SPA + one built-in agent
+#   docker build --pull --target agent  -t boxcutter-agent  .   # scanner = boxcutter image + supervisor
+#
+# Use --pull: both stages sit on ghcr.io/zzzteph/boxcutter:latest, and without it Docker happily reuses the
+# base layer it already has, so a "rebuild" can quietly ship the OLD engine. The engine version each agent
+# reports on the Scanners page is what confirms the rebuild actually took a newer boxcutter.
 #
 # `docker build .` with no target builds the server (the last stage). GitHub Actions builds both targets, each
 # multi-arch (amd64 + arm64). Put TLS (a reverse proxy) in front of the server for remote agents/browsers.

@@ -18,6 +18,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -32,7 +34,15 @@ CONFIG_PATH = os.environ.get("RUNNER_CONFIG", os.path.join(os.path.dirname(os.pa
                                                            ".runner-config.json"))
 MAX_SLOTS = 32
 BOXCUTTER_CMD = os.environ.get("BOXCUTTER_CMD", "boxcutter").split()
-VERSION = "0.1.0"
+VERSION = "0.1.0"                      # the SUPERVISOR's own version - not the engine's, see engine_version()
+# The ENGINE version is the one that matters operationally: which boxcutter this agent actually runs, so the
+# fleet page can show it (and flag agents still on an older engine). It is baked into the image at build time
+# and cannot change under a running container, so we probe it ONCE at startup and cache it for the life of the
+# process - a rebuild is what picks up a newer engine, and that restarts the agent anyway. No live re-probing.
+# BOXCUTTER_VERSION skips the probe entirely when you already know the tag you built.
+ENGINE_VERSION = os.environ.get("BOXCUTTER_VERSION", "").strip()
+ENGINE_PROBE_TIMEOUT = int(os.environ.get("BOXCUTTER_VERSION_TIMEOUT", "15") or 15)
+ENGINE_PROBE_TRIES = 3                 # then give up: an engine that isn't there won't appear later
 # MOCK_RUNNER=1 runs the whole pipe without the engine: emit a couple of live lines and a canned findings
 # envelope. Lets `docker compose up` / a local supervisor demonstrate claim->event->result->diff offline
 # (and never scans a real target). See BUILD.md testing notes.
@@ -69,6 +79,7 @@ def _local_ip() -> str:
 
 _IP = _local_ip()
 STATE = {"connected": False, "runner_id": None, "server": "", "concurrency": 1, "ip": _IP,
+         "version": VERSION, "engine_version": ENGINE_VERSION,
          "slots": {}, "recent": [], "metrics": {}, "error": ""}   # slots: {idx:{job,target}}; recent: last jobs
 _LOCK = threading.Lock()
 _ENROLL_LOCK = threading.Lock()             # serialize enroll so startup + heartbeat don't double-register
@@ -127,7 +138,8 @@ def enroll() -> bool:
 
 
 def _enroll_locked() -> bool:
-    body = {"name": CFG.get("name", "runner"), "version": VERSION, "slots": CFG.get("concurrency", 1),
+    body = {"name": CFG.get("name", "runner"), "version": VERSION, "engine_version": engine_version(),
+            "slots": CFG.get("concurrency", 1),
             "host": CFG.get("name", ""), "ip": _IP, "internal": bool(CFG.get("internal"))}
     if CFG.get("enroll_token"):
         body["token"] = CFG["enroll_token"]
@@ -218,6 +230,108 @@ def _kill_tree(proc) -> None:
                 proc.kill()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---- engine version -----------------------------------------------------------------------------------------
+_ENGINE = {"version": ENGINE_VERSION, "tries": 0, "probing": False}
+_ENGINE_LOCK = threading.Lock()
+_VERSION_RE = re.compile(r"\d+\.\d+(?:\.\w+)*")
+
+
+def _parse_version(text: str) -> str:
+    """Pull the version out of `boxcutter --version` output. Keeps the whole line minus the program name, so
+    `boxcutter 1.4.2 (2026-07-30)` is reported as `1.4.2 (2026-07-30)` rather than trimmed down to digits -
+    what the engine calls itself is what the fleet page should show."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or len(line) > 120 or not _VERSION_RE.search(line):
+            continue
+        words = [w for w in line.split() if w.lower().strip(":,") not in ("boxcutter", "boxcutter.py", "version")]
+        out = " ".join(words).strip(" :,") or _VERSION_RE.search(line).group(0)
+        return (out[1:] if re.match(r"^[vV]\d", out) else out)[:60]
+    return ""
+
+
+def _run_probe(argv: list) -> tuple:
+    """Run a short-lived side command (never a scan). Returns (rc, output); the whole process tree is reaped on
+    timeout so a CLI that ignores the flag and blocks can't leave anything behind."""
+    proc = None
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=_POSIX)
+        out, err = proc.communicate(timeout=ENGINE_PROBE_TIMEOUT)
+        return proc.returncode, (out or "") + "\n" + (err or "")
+    except Exception:  # noqa: BLE001 - missing engine, timeout, anything: this is best-effort telemetry
+        _kill_tree(proc)
+        return 1, ""
+
+
+def _probe_engine_version() -> str:
+    """Ask the engine what version it is. Only a clean exit counts, so an unsupported flag (argparse error plus
+    usage text) is never mistaken for a version. Falls back to reading the installed source."""
+    if MOCK:
+        return "mock"
+    for flag in ("--version", "-version", "version"):
+        rc, out = _run_probe(BOXCUTTER_CMD + [flag])
+        if rc == 0:
+            v = _parse_version(out)
+            if v:
+                return v
+    return _engine_version_from_source()
+
+
+def _engine_version_from_source() -> str:
+    """Fallback for an engine whose CLI has no version flag: read it off disk - a VERSION file shipped next to
+    the entrypoint, or a `__version__` / `VERSION = "..."` assignment inside it."""
+    script = next((t for t in reversed(BOXCUTTER_CMD) if t.endswith(".py") and os.path.exists(t)), "")
+    if not script and BOXCUTTER_CMD:
+        script = shutil.which(BOXCUTTER_CMD[0]) or ""
+    if not script:
+        return ""
+    root = os.path.dirname(os.path.abspath(script))
+    for name in ("VERSION", "VERSION.txt", "version.txt"):
+        try:
+            with open(os.path.join(root, name), encoding="utf-8", errors="replace") as fh:
+                v = fh.read().strip()
+            if v and len(v) <= 60:
+                return v
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        with open(script, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(20000)
+        m = re.search(r"""^\s*(?:__version__|VERSION)\s*[:=]\s*["']([^"']{1,60})["']""", head, re.M)
+        if m:
+            return m.group(1).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _refresh_engine_version() -> None:
+    try:
+        v = _probe_engine_version()
+    except Exception:  # noqa: BLE001
+        v = ""
+    with _ENGINE_LOCK:
+        # keep the last known good answer if a probe transiently fails (disk hiccup, engine still unpacking)
+        _ENGINE.update(version=v or _ENGINE["version"], tries=_ENGINE["tries"] + 1, probing=False)
+        current = _ENGINE["version"]
+    with _LOCK:
+        STATE["engine_version"] = current
+
+
+def engine_version() -> str:
+    """The engine version we report to the server: probed once and then cached for the life of the process.
+    Never blocks the caller - the probe runs on a background thread, so the first beat may go out empty and the
+    next one (~10s later) carries the answer. Retried only while it comes back empty, never on a timer."""
+    if ENGINE_VERSION:
+        return ENGINE_VERSION
+    with _ENGINE_LOCK:
+        if not _ENGINE["version"] and not _ENGINE["probing"] and _ENGINE["tries"] < ENGINE_PROBE_TRIES:
+            _ENGINE["probing"] = True
+            _spawn(_refresh_engine_version)
+        return _ENGINE["version"]
 
 
 def run_job(job: dict, secrets: dict) -> dict:
@@ -470,7 +584,8 @@ def _heartbeat_once() -> None:
             resp = _req("POST", "/runner/heartbeat",
                         {"status": "busy" if busy else "idle", "slots": CFG.get("concurrency", 1),
                          "busy_slots": len(busy), "current_jobs": busy, "version": VERSION,
-                         "ip": _IP, "metrics": m}, CFG["token"], timeout=15)
+                         "engine_version": engine_version(), "ip": _IP, "metrics": m},
+                        CFG["token"], timeout=15)
             # the server (Scanners UI) can ask us to run more/fewer boxcutters — adopt it and persist
             if isinstance(resp, dict) and resp.get("desired_slots") is not None:
                 ds = max(0, min(int(resp["desired_slots"]), MAX_SLOTS))
@@ -584,6 +699,8 @@ _DASH_HTML = ("<!doctype html><meta charset=utf-8><meta name=viewport content='w
               "<div class=row><h1>boxcutter scanner</h1><button class=ghost onclick=logout()>Log out</button></div>"
               "<div class=card><b>Status:</b> <span id=st></span>"
               "<div class=muted style='font-size:12px;margin-top:4px'>IP: <span id=ip></span></div>"
+              "<div class=muted style='font-size:12px'>boxcutter <span id=engine></span> "
+              "&middot; agent v<span id=agent></span></div>"
               "<div style='margin-top:10px'><span class=muted>CPU</span><div class=meter><div id=cpu></div></div>"
               "<span class=muted>Memory</span><div class=meter><div id=mem></div></div></div></div>"
               "<div class=card><h2>Connection</h2>"
@@ -606,6 +723,8 @@ _DASH_HTML = ("<!doctype html><meta charset=utf-8><meta name=viewport content='w
               "async function refresh(){let r=await fetch('/state');if(r.status==401){location.reload();return;}let s=await r.json();"
               "document.getElementById('st').innerHTML=s.connected?'<span class=ok>connected</span> (scanner #'+esc(s.runner_id)+')':'<span class=bad>disconnected</span> '+esc(s.error||'');"
               "document.getElementById('ip').textContent=s.ip||'—';"
+              "document.getElementById('engine').textContent=s.engine_version||'unknown';"
+              "document.getElementById('agent').textContent=s.version||'?';"
               "let m=s.metrics||{};document.getElementById('cpu').style.width=(m.cpu||0)+'%';document.getElementById('mem').style.width=(m.mem||0)+'%';"
               "document.getElementById('drainbtn').textContent=(s.concurrency>0?'Pause (drain)':'Resume');"
               "if(!_filled){if(s.server)server.value=s.server;conc.value=s.concurrency;_filled=true;}"
@@ -715,6 +834,7 @@ def main() -> None:
     for i in range(MAX_SLOTS):
         registry[f"worker-{i}"] = {"target": worker, "args": (i,), "thread": _spawn(worker, (i,))}
     registry["heartbeat"] = {"target": heartbeat_loop, "args": (), "thread": _spawn(heartbeat_loop)}
+    engine_version()                     # kick the one-shot (background) engine probe at startup
     _spawn(watchdog, (registry,))
     if CFG.get("server_url") and (CFG.get("enroll_token") or CFG.get("api_key") or CFG.get("username")):
         enroll()

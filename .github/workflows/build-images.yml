@@ -4,8 +4,14 @@ name: build-images
 #   ghcr.io/<owner>/boxcutter-server   all-in-one: API + built SPA + one built-in agent — multi-arch amd64+arm64
 #   ghcr.io/<owner>/boxcutter-agent    the scale-out scanner (boxcutter image + supervisor) — multi-arch amd64+arm64
 #
-# Runs on pushes to the default branch, on version tags (v1.2.3), and on demand. Each build produces a
+# Runs on pushes to the default branch, on version tags (v1.2.3), on demand, and DAILY. Each build produces a
 # multi-arch manifest, so `docker pull …:latest` picks the right architecture automatically.
+#
+# The daily run is what keeps the engine current: both images are FROM ghcr.io/zzzteph/boxcutter:latest, which
+# is updated far more often than this repo, so without a scheduled rebuild a new boxcutter would never reach
+# anyone until someone happened to push a commit here. With `pull: true` below, every run re-resolves that
+# base — so each image eventually gets rebuilt onto the newest engine on its own. The version each agent
+# reports on the Scanners page is what shows which engine a running scanner ended up with.
 #
 # Both images are FROM ghcr.io/zzzteph/boxcutter, whose `latest` manifest carries amd64 AND arm64 — so both
 # architectures build cleanly. (If that base ever drops an arch, the matching build here would fail until it's
@@ -18,6 +24,11 @@ on:
   push:
     branches: [ main, master ]
     tags: [ 'v*' ]
+  schedule:
+    # Daily, off the hour (on-the-hour crons queue behind everyone else's and get delayed). GitHub disables
+    # scheduled workflows in a repo with no activity for 60 days — re-enable it from the Actions tab if that
+    # ever happens, or just push a commit.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -92,6 +103,10 @@ jobs:
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platforms }}
           push: true
+          # Always re-fetch ghcr.io/zzzteph/boxcutter:latest instead of letting the gha cache serve a stale
+          # base layer - a rebuild has to actually pick up the newest engine, which is what the Scanners page
+          # then reports as each agent's boxcutter version.
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false

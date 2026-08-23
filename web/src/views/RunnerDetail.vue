@@ -45,7 +45,8 @@ onUnmounted(() => clearInterval(timer))
         <router-link to="/scanners" class="btn">← Scanners</router-link>
       </div>
     </div>
-    <div class="muted">{{ r.busy_slots }}/{{ r.slots }} slots busy · v{{ r.version || '?' }}
+    <div class="muted">{{ r.busy_slots }}/{{ r.slots }} slots busy
+      · boxcutter <b>{{ r.engine_version || 'unknown' }}</b> · agent v{{ r.version || '?' }}
       <span v-if="r.ip"> · <code>{{ r.ip }}</code></span>
       <span v-if="r.host && r.host !== r.ip"> · {{ r.host }}</span> · last beat {{ timeAgo(r.last_heartbeat) }}</div>
 

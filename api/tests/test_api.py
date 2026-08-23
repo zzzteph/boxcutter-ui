@@ -910,3 +910,27 @@ def test_llm_profile_patch_sets_key(client):
     assert r.status_code == 200 and r.json()["has_key"] is True
     after = next(p for p in client.get("/llm-profiles", headers=h).json() if p["id"] == pid)
     assert after["has_key"] is True and after["model"] == "claude-x"
+
+
+def test_engine_version_is_reported_per_scanner(client):
+    """The boxcutter image is updated often, so the fleet must show the exact engine each scanner is running -
+    reported at enroll and refreshed on every heartbeat."""
+    h = auth(login(client))
+    r = client.post("/runner/enroll", json={"token": "test-enroll", "name": "ver-runner", "slots": 1,
+                                            "version": "0.1.0", "engine_version": "2.3.1"})
+    assert r.status_code == 200, r.text
+    rid, rh = r.json()["runner_id"], auth(r.json()["runner_token"])
+
+    def row():
+        return next(x for x in client.get("/runners", headers=h).json() if x["id"] == rid)
+
+    assert row()["engine_version"] == "2.3.1"        # the engine ...
+    assert row()["version"] == "0.1.0"               # ... tracked separately from the agent itself
+
+    client.post("/runner/heartbeat", json={"status": "idle", "slots": 1, "version": "0.1.0",
+                                           "engine_version": "2.4.0"}, headers=rh)
+    assert row()["engine_version"] == "2.4.0"        # engine updated under a live agent -> fleet moves with it
+
+    client.post("/runner/heartbeat", json={"status": "idle", "slots": 1, "version": "0.1.0"}, headers=rh)
+    assert row()["engine_version"] == "2.4.0"        # a beat that hasn't probed yet must not erase it
+    assert client.get(f"/runners/{rid}", headers=h).json()["engine_version"] == "2.4.0"

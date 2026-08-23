@@ -117,7 +117,8 @@ class EnrollIn(BaseModel):
     name: str = "runner"
     host: str = ""
     ip: str = ""
-    version: str = ""
+    version: str = ""                     # agent (supervisor) version
+    engine_version: str = ""              # boxcutter engine version the agent probed
     slots: int = 1
     internal: bool = False                # the all-in-one server's built-in agent enrolls with this
 
@@ -143,10 +144,12 @@ def enroll(body: EnrollIn, session: Session = Depends(get_session)):
     runner = session.exec(select(Runner).where(Runner.internal == True)).first() if body.internal else None  # noqa: E712
     if runner is not None:
         runner.name, runner.host, runner.ip, runner.version = body.name, body.host, body.ip, body.version
+        runner.engine_version = body.engine_version or runner.engine_version
         runner.slots, runner.token_hash = body.slots, hash_token(token)
         runner.last_heartbeat = datetime.now(timezone.utc)
     else:
-        runner = Runner(name=body.name, host=body.host, ip=body.ip, version=body.version, slots=body.slots,
+        runner = Runner(name=body.name, host=body.host, ip=body.ip, version=body.version,
+                        engine_version=body.engine_version, slots=body.slots,
                         internal=body.internal, token_hash=hash_token(token),
                         last_heartbeat=datetime.now(timezone.utc))
     session.add(runner)
@@ -289,6 +292,7 @@ class HeartbeatIn(BaseModel):
     busy_slots: int = 0
     current_jobs: list[int] = []
     version: str = ""
+    engine_version: str = ""           # re-probed by the agent periodically, so an engine update shows up here
     ip: str = ""
     metrics: dict = {}                 # {"cpu": pct, "mem": pct} best-effort from the runner host
 
@@ -303,6 +307,8 @@ def heartbeat(body: HeartbeatIn, runner: Runner = Depends(current_runner),
     runner.metrics_json = json.dumps(body.metrics or {})
     if body.version:
         runner.version = body.version
+    if body.engine_version:            # empty = the agent hasn't probed yet; keep the last known answer
+        runner.engine_version = body.engine_version
     if body.ip:
         runner.ip = body.ip
     runner.last_heartbeat = datetime.now(timezone.utc)
@@ -337,7 +343,8 @@ def _runner_row(r: Runner) -> dict:
     if hb and hb.tzinfo is None:
         hb = hb.replace(tzinfo=timezone.utc)
     connected = hb is not None and hb > (datetime.now(timezone.utc) - timedelta(seconds=45))
-    return {"id": r.id, "name": r.name, "host": r.host, "ip": r.ip, "version": r.version, "internal": r.internal,
+    return {"id": r.id, "name": r.name, "host": r.host, "ip": r.ip, "version": r.version,
+            "engine_version": r.engine_version, "internal": r.internal,
             "status": r.status if connected else "disconnected", "connected": connected,
             "slots": r.slots, "desired_slots": r.desired_slots, "busy_slots": r.busy_slots,
             "current_jobs": json.loads(r.current_jobs_json or "[]"),

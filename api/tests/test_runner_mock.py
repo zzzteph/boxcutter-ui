@@ -217,3 +217,79 @@ def test_agent_login_is_local_and_settable():
     sup.CFG["server_url"] = "http://example.com:8000"            # a configured server must NOT change the login
     assert sup._validate_login("root", "s3cret!") is True
     assert sup._validate_login("root", "server-only-cred") is False
+
+
+def test_engine_version_is_asked_of_the_engine():
+    """The fleet has to show the boxcutter ENGINE's version, not the supervisor's, so the agent asks the engine
+    itself and reports back exactly what it answers."""
+    import sys
+    import tempfile
+
+    sup = _load_supervisor()
+    with tempfile.TemporaryDirectory() as td:
+        engine = pathlib.Path(td) / "boxcutter.py"
+        engine.write_text("import sys\n"
+                          "if '--version' in sys.argv:\n"
+                          "    print('boxcutter 9.9.1 (build 2026-08-01)')\n"
+                          "    sys.exit(0)\n"
+                          "sys.exit(2)\n", encoding="utf-8")
+        sup.MOCK = False
+        sup.BOXCUTTER_CMD = [sys.executable, str(engine)]
+        assert sup._probe_engine_version() == "9.9.1 (build 2026-08-01)"
+
+
+def test_engine_version_falls_back_to_source_and_ignores_usage_text():
+    """An engine with no version flag still has to be identified: only a clean exit counts as an answer (so
+    argparse usage text is never mistaken for a version), and we read the installed source instead."""
+    import sys
+    import tempfile
+
+    sup = _load_supervisor()
+    with tempfile.TemporaryDirectory() as td:
+        engine = pathlib.Path(td) / "boxcutter.py"
+        engine.write_text('__version__ = "7.2.0"\n'
+                          "import sys\n"
+                          "sys.stderr.write('usage: boxcutter.py [-h] 1.0.0\\n')\n"
+                          "sys.exit(2)\n", encoding="utf-8")
+        sup.MOCK = False
+        sup.BOXCUTTER_CMD = [sys.executable, str(engine)]
+        assert sup._probe_engine_version() == "7.2.0"
+
+        (pathlib.Path(td) / "VERSION").write_text("2026.08.1\n", encoding="utf-8")
+        assert sup._probe_engine_version() == "2026.08.1"   # a shipped VERSION file wins
+
+
+def test_engine_version_never_blocks_the_heartbeat():
+    """Probing runs on a background thread: enroll/heartbeat send the previous answer immediately and pick the
+    new one up on the next beat, so a slow or wedged engine can never stall the agent's reporting."""
+    import time as _t
+
+    sup = _load_supervisor()
+    sup.ENGINE_VERSION = ""
+    sup._ENGINE.update(version="", tries=0, probing=False)
+    sup._probe_engine_version = lambda: (_t.sleep(1.5) or "5.5.5")
+
+    t0 = _t.time()
+    assert sup.engine_version() == ""            # first call returns at once, probe runs behind it
+    assert _t.time() - t0 < 0.5
+    _t.sleep(2.5)
+    assert sup.engine_version() == "5.5.5"       # ... and the answer lands for the next beat
+
+
+def test_engine_version_is_probed_once_not_on_a_timer():
+    """The engine is baked into the image and can't change under a running container, so the answer is cached
+    for the life of the process - a rebuild (which restarts the agent) is what picks up a newer engine."""
+    import time as _t
+
+    sup = _load_supervisor()
+    calls = []
+    sup.ENGINE_VERSION = ""
+    sup._ENGINE.update(version="", tries=0, probing=False)
+    sup._probe_engine_version = lambda: (calls.append(1), "4.1.0")[1]
+
+    for _ in range(50):                          # first call probes; every later beat reads the cache
+        if sup.engine_version() == "4.1.0":
+            break
+        _t.sleep(0.05)
+    assert sup.engine_version() == "4.1.0"
+    assert len(calls) == 1

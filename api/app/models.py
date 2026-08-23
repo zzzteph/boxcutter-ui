@@ -163,7 +163,8 @@ class Runner(SQLModel, table=True):
     internal: bool = False                                    # the all-in-one server's built-in agent: a permanent
     #                                                           singleton — concurrency-adjustable but NOT removable
     ip: str = Field(default="", max_length=64)                # the agent host's IP, reported at enroll/heartbeat
-    version: str = Field(default="", max_length=40)
+    version: str = Field(default="", max_length=40)            # the agent (supervisor) version
+    engine_version: str = Field(default="", max_length=64)    # the boxcutter engine the agent actually runs
     status: str = Field(default="idle", max_length=24)        # idle | busy | disconnected (from last_heartbeat)
     slots: int = 1                                            # concurrency the agent currently reports
     desired_slots: Optional[int] = None                       # concurrency the server is asking the agent to adopt

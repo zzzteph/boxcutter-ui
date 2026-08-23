@@ -36,10 +36,17 @@ Env (or the local UI, which persists to `$RUNNER_CONFIG`):
 - `ENROLL_TOKEN` — an enroll token from the server Fleet page (or `RUNNER_USER`/`RUNNER_PASSWORD`).
 - `CONCURRENCY` — number of parallel boxcutter jobs (changeable live from the UI).
 - `BOXCUTTER_CMD` — how to invoke the engine (default `boxcutter`).
+- `BOXCUTTER_VERSION` — pin the engine version shown on the Scanners page instead of probing for it.
 - `RUNNER_UI_PORT` — local control UI port (default 7070).
 
 ## Notes
 
+- The agent reports **two** versions: the supervisor's own (`Agent`) and the boxcutter engine it actually runs
+  (`Boxcutter`), which it gets by asking the engine once at startup (`--version`, falling back to the installed
+  source). The engine is baked into the image, so that value only changes when the image is rebuilt — which is
+  exactly how you confirm a rebuild picked up a newer boxcutter. The GHCR images are rebuilt daily by the
+  `build-images` workflow (with `pull: true`, so the `ghcr.io/zzzteph/boxcutter:latest` base is re-resolved
+  every run); pull a fresh agent image and restart to move a scanner onto the newer engine.
 - The supervisor streams the engine's **stderr** as live events (that is where the live log and per-agent
   reasoning are) and parses **stdout** as the findings envelope. Agents that print a markdown report to stdout
   (e.g. `irvin`) are stored as a report; tools/workflows return a JSON envelope parsed into findings.
